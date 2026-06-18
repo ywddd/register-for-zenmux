@@ -101,16 +101,19 @@ node web_panel.mjs
 1. 已注册（有 session）直接跳过，不重复打码
 2. 随机选邀请码，打开 https://zenmux.ai/invite/{code}
 3. 填邮箱
-4. 探测 Turnstile（确认需要才打码，省钱；失败自动重试 3 次）
+4. 探测首屏 Turnstile（确认需要才打码，省钱；失败自动重试 3 次）
 5. 点 Send 发送验证码
 6. hotmail_helper 取验证码（仅认本次发送后的新邮件，旧码过滤）
-7. 输入验证码（OTP 多框 / 单框 / 普通框自适应）
-8. 探测二次验证（Turnstile / reCAPTCHA / hCaptcha），需要则打码
-9. 登录成功判定（URL 跳转 + referral/info 二次确认，避免误判）
-10. 保存 session
-11. 自动提取该账号邀请码（加入轮换池）
-12. 自动创建 Pay API key（sk-ai-v1）+ Platform API key（sk-mg-v1）
-13. Pay key 自动导入 gpt-load（若配置 GPTLOAD_PAY_GROUP_ID）
+7. 输入验证码（OTP 多框 / 单框 / 普通框自适应；单框输完补按 Enter，输不满 6 位自动重输）
+8. 等 5s 缓冲后持续轮询：探测二次验证（实测为 reCAPTCHA）或判定登录成功
+9. 登录成功的【唯一硬证据】= /api/referral/info 返回 200
+   （ZenMux 是弹窗登录，输验证码时 URL 不变、cookie 可能是无效 session，
+    不能用 URL/cookie 判断，否则会误判"已登录"跳过二次验证 → 注册失败）
+10. 未登录成功时：出现 reCAPTCHA widget 就打码，否则继续轮询 referral/info（最多 ~90s）
+11. referral/info 返回 200 → 保存 session
+12. 自动提取该账号邀请码（加入轮换池）
+13. 自动创建 Pay API key（sk-ai-v1）+ Platform API key（sk-mg-v1）
+14. Pay key 自动导入 gpt-load（若配置 GPTLOAD_PAY_GROUP_ID）
 ```
 
 **验证码收不到时**：第 1 轮等 65 秒，未收到重发；第 2 轮等 15 秒，仍未收到则跳过该账号。
@@ -270,6 +273,9 @@ server {
 **Q: Turnstile 打码失败？**
 确认 `CAPSOLVER_API_KEY` 正确、余额充足。代码会自动重试 3 次。
 
+**Q: 二次验证（reCAPTCHA）打码失败 / 注册总停在"未登录成功"？**
+输完邮箱验证码后 ZenMux 可能要求二次 reCAPTCHA。登录成功判定只认 `/api/referral/info` 返回 200——弹窗登录下 URL 和 cookie 都不可信。若一直 401，多半是 OTP 没输进去或 reCAPTCHA 没打对：检查 CapSolver 余额、确认二次验证 sitekey（实测 `6LdN_REsAAAAAKSlH2k4VNXo`）。
+
 **Q: 获取验证码超时？**
 检查 `refresh_token` 是否有效、hotmail_helper 是否运行（面板会自动起）、垃圾邮件文件夹。第 1 轮等 65s、第 2 轮等 15s，仍未收到则跳过该账号。
 
@@ -280,7 +286,7 @@ server {
 不会。有 session 的账号自动跳过。
 
 **Q: 并发注册会损坏数据吗？**
-不会。账号/邀请码/API Key 的文件写入都有互斥锁，并发安全。
+不会。账号/邀请码/API Key 的文件写入都有互斥锁，并发安全。但并发会放大二次验证的时序问题（多个号同时懒渲染 reCAPTCHA、同时打码），建议先单号跑通再调高并发。
 
 **Q: 代理连不上怎么办？**
 代理连接失败会自动跳过该账号，不影响其它账号注册。检查 `PROXY_URL` 格式与代理可用性。

@@ -852,26 +852,6 @@ async function solveSecondaryCaptcha(page, taskId, probe, sitekey) {
   return false;
 }
 
-// 调试截图：注册失败时把页面状态存下来，便于排查"验证码对却登录失败"
-async function debugScreenshot(page, email, tag, taskId) {
-  try {
-    fs.mkdirSync(RESULTS_DIR, { recursive: true });
-    const safe = email.replace(/[^a-zA-Z0-9@._-]/g, "_");
-    const file = path.join(RESULTS_DIR, `debug_${tag}_${safe}_${Date.now()}.png`);
-    await page.screenshot({ path: file, fullPage: true });
-    taskLog(taskId, `📷 已截图: ${path.basename(file)} (URL: ${page.url()})`);
-    // 同时抓页面可见错误提示文字
-    const errText = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('[class*="error" i], [class*="Error"], [role="alert"]'));
-      const texts = els.map(e => (e.textContent || "").trim()).filter(t => t && t.length < 200);
-      return texts.slice(0, 3);
-    }).catch(() => []);
-    if (errText && errText.length) taskLog(taskId, `页面错误提示: ${JSON.stringify(errText)}`);
-  } catch (e) {
-    // 截图失败不影响主流程
-  }
-}
-
 async function registerAccount(account, taskId) {
   const { email, refresh_token, client_id } = account;
 
@@ -1268,11 +1248,19 @@ async function registerAccount(account, taskId) {
       }
       taskLog(taskId, "已输入验证码 (多框 OTP)");
     } else {
-      // 单框 OTP: 用 type() 触发 React onChange
+      // 单框 OTP: 用 type() 逐位触发 React onChange，delay 稍慢确保每位都触发
       const otpSingle = await page.$('input.otpNativeInput-LCOdN2Gu, input[maxlength="6"]');
       if (otpSingle && await otpSingle.isVisible().catch(() => false)) {
         await otpSingle.click();
-        await otpSingle.type(code, { delay: 100 });
+        await otpSingle.type(code, { delay: 120 });
+        // 校验是否真的输满 6 位（React 偶尔吞掉末位），少了就补齐
+        const filled = await otpSingle.inputValue().catch(() => "");
+        if (filled.length < 6) {
+          taskLog(taskId, `⚠ OTP 只输进去 ${filled.length} 位，补齐重输`);
+          await otpSingle.click({ clickCount: 3 });
+          await otpSingle.fill("");
+          await otpSingle.type(code, { delay: 150 });
+        }
         taskLog(taskId, "已输入验证码 (单框 OTP type)");
       } else {
         // 普通输入框
@@ -1294,194 +1282,170 @@ async function registerAccount(account, taskId) {
 
     taskLog(taskId, "验证码已输入，等待登录...");
 
-    // ---- 9.5 二次 Turnstile 探测（填完验证码后可能再次出现） ----
-    // 提交验证码后，ZenMux 有时会要求二次 Turnstile 验证
-    // 复用上面的 detectTurnstileState 逻辑探测，需要时再打码
-    async function detectTurnstileState2() {
+    // 单框 OTP 可能不会自动提交：输完 6 位若没有"Verify/Continue"按钮可点，
+    // 尝试按回车触发提交（点错不报错）。
+    try { await page.keyboard.press("Enter"); } catch (e) {}
+
+    // ---- 9.5 二次验证探测 + 打码 ----
+    // 输完验证码后，ZenMux 可能要求二次验证（实测是 reCAPTCHA，sitekey 6LdN_REsAAAAAKSlH2k4...）。
+    // 关键教训：ZenMux 登录是弹窗，输验证码时 URL 仍是 zenmux.ai/ 或 /invite/xxx，
+    // 用宽松 URL/cookie 判断会误判"已登录"而跳过二次验证 → 注册失败。
+    // 所以登录成功的唯一硬证据 = /api/referral/info 返回 200。
+    // 既然登录判定是硬的（不会误判），就不需要强制长时间等待再开始探测 ——
+    // 直接轮询：出现二次验证 widget 就打码，referral/info 返回 200 就算登录成功，都没有就继续等。
+    // 仅留 5s 缓冲，让 OTP 提交的请求先发出去、二次验证 widget 有时间渲染。
+    await sleep(5000);
+
+    // 探测：一直轮询直到 出现二次验证 / 硬登录成功 / 超时
+    async function detectSecondaryCaptcha() {
       return await page.evaluate(() => {
-        const result = { hasWidget: false, hasToken: false, submitEnabled: false, submitDisabled: false };
-        // 任意验证 widget：Turnstile / reCAPTCHA / hCaptcha
-        const hasTurnstile = !!document.querySelector('iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"], [data-sitekey], .cf-turnstile, [class*="turnstile" i]');
-        const hasRecaptcha = !!document.querySelector('.g-recaptcha, iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"], #g-recaptcha-response');
-        const hasHcaptcha = !!document.querySelector('iframe[src*="hcaptcha.com"], .h-captcha, textarea[name="h-captcha-response"]');
-        result.hasWidget = hasTurnstile || hasRecaptcha || hasHcaptcha;
-        // Turnstile token
-        const tokenInputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], #g-recaptcha-response, textarea[name="h-captcha-response"]');
+        const r = { need: false, type: null, sitekey: null, action: null, hasToken: false };
+        // 任一验证 token 已就位 → 已自动通过，无需打码
+        const tokenInputs = document.querySelectorAll(
+          'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], #g-recaptcha-response, textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"]'
+        );
         for (const input of tokenInputs) {
-          if (input.value && input.value.length > 20) { result.hasToken = true; break; }
+          if (input.value && input.value.length > 20) { r.hasToken = true; break; }
         }
-        // 找提交/确认按钮（Verify/Continue/Submit/Sign in 等）
-        const btns = Array.from(document.querySelectorAll("button")).filter(e => e.offsetParent);
-        const submit = btns.find(b => {
-          const t = (b.textContent || "").toLowerCase();
-          return t.includes("verify") || t.includes("continue") || t.includes("submit") || t.includes("sign in") || t.includes("confirm") || t.includes("登录") || t.includes("验证") || t.includes("确认");
-        });
-        if (submit) {
-          result.submitEnabled = !submit.disabled;
-          result.submitDisabled = submit.disabled;
+        if (r.hasToken) return r;
+        // reCAPTCHA（明确特征）
+        const recaptchaDiv = document.querySelector('.g-recaptcha[data-sitekey], .g-recaptcha');
+        const recaptchaIframe = document.querySelector('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]');
+        if (recaptchaDiv || recaptchaIframe) {
+          r.need = true; r.type = "recaptcha";
+          if (recaptchaDiv) r.sitekey = recaptchaDiv.getAttribute("data-sitekey");
+          if (recaptchaIframe) { const m = recaptchaIframe.src.match(/[?&]k=([^&]+)/); if (m) r.sitekey = decodeURIComponent(m[1]); }
+          const sc = Array.from(document.querySelectorAll('script')).find(s => /grecaptcha\.execute/.test(s.textContent || ''));
+          if (sc) {
+            const m = (sc.textContent || '').match(/grecaptcha\.execute\([^,]+,\s*\{action:\s*['"]([^'"]+)['"]/);
+            if (m) r.action = m[1];
+            if (!recaptchaDiv) r.type = "recaptcha_v3";
+          }
+          return r;
         }
-        return result;
+        // hCaptcha
+        const hcDiv = document.querySelector('.h-captcha[data-sitekey], .h-captcha');
+        const hcIframe = document.querySelector('iframe[src*="hcaptcha.com"]');
+        if (hcDiv || hcIframe) {
+          r.need = true; r.type = "hcaptcha";
+          if (hcDiv) r.sitekey = hcDiv.getAttribute("data-sitekey");
+          if (hcIframe) { const m = hcIframe.src.match(/sitekey=([^&]+)/); if (m) r.sitekey = decodeURIComponent(m[1]); }
+          return r;
+        }
+        // Cloudflare Turnstile（只认硬特征）
+        const tsDiv = document.querySelector('.cf-turnstile[data-sitekey], .cf-turnstile');
+        const tsIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        if (tsDiv || tsIframe) {
+          r.need = true; r.type = "turnstile";
+          if (tsDiv) r.sitekey = tsDiv.getAttribute("data-sitekey");
+          if (tsIframe) { const m = tsIframe.src.match(/sitekey=([^&]+)/); if (m) r.sitekey = decodeURIComponent(m[1]); }
+        }
+        return r;
       });
     }
-
-    // 给页面时间渲染可能的二次验证
-    await sleep(2000);
-
-    // 探测是否出现二次验证（Turnstile / reCAPTCHA / hCaptcha 都算）
-    // 最多等 8 秒确认；只要出现验证 widget 且没有 token，就需要打码
-    let needSecondCapSolver = false;
-    for (let i = 0; i < 8; i++) {
-      const st = await detectTurnstileState2();
-      // 已有 token 或提交按钮已启用 → 不需要打码
-      if (st.hasToken || st.submitEnabled) {
-        break;
-      }
-      // 出现了任何验证 widget 且无 token → 需要打码（确认 1 次避免误判）
-      if (st.hasWidget && !st.hasToken) {
-        if (i >= 1) { needSecondCapSolver = true; break; }
-      }
-      // 已登录成功（URL 跳转）→ 无需处理
-      const url = page.url();
-      if (url.includes("/chat") || url.includes("/settings") || (url.includes("zenmux.ai") && !url.includes("/sign") && !url.includes("/login") && !url.includes("/verify"))) {
-        break;
-      }
-      await sleep(1000);
+    let secondary = null;
+    let loginDetectedEarly = false;
+    for (let i = 0; i < 45; i++) {  // 45 × 2s = 最多再 90s（前面已等 5s 缓冲）
+      secondary = await detectSecondaryCaptcha();
+      if (secondary.need || secondary.hasToken) break;
+      // 登录成功的唯一硬证据：/api/referral/info 返回 200（非 401）。
+      // 服务端真正下发有效 session、且账号已验证通过才会 200。
+      // sessionId cookie / URL 都不可信（弹窗登录 URL 不变，cookie 可能是无效 session）。
+      try {
+        const probe = await page.evaluate(async () => {
+          const r = await fetch("/api/referral/info", { headers: { "Accept": "application/json" }, credentials: "include" });
+          return r.ok ? { ok: true } : { ok: false, status: r.status };
+        });
+        if (probe && probe.ok) { loginDetectedEarly = true; break; }
+      } catch (e) {}
+      await sleep(2000);
     }
 
-    if (needSecondCapSolver) {
-      taskLog(taskId, "⚠ 填完验证码后检测到二次验证，识别类型并打码...");
+    if (secondary && secondary.need) {
+      taskLog(taskId, `⚠ 检测到二次验证：${secondary.type}，打码...`);
       try {
-        // 探测二次验证类型：Cloudflare Turnstile / reCAPTCHA v2 / reCAPTCHA v3 / hCaptcha
-        const probe = await page.evaluate(() => {
-          const r = { type: null, sitekey: null, action: null };
-          // reCAPTCHA（优先判断，因为 v2/v3 都用 .g-recaptcha 或 recaptcha iframe）
-          const recaptchaDiv = document.querySelector('.g-recaptcha, [data-sitekey]:not([data-sitekey*="0x"])');
-          const recaptchaIframe = document.querySelector('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]');
-          if (recaptchaIframe || recaptchaDiv) {
-            r.type = "recaptcha";
-            // sitekey
-            const c = document.querySelector('.g-recaptcha[data-sitekey], [data-sitekey]');
-            if (c) r.sitekey = c.getAttribute("data-sitekey");
-            if (recaptchaIframe) {
-              const m = recaptchaIframe.src.match(/[?&]k=([^&]+)/);
-              if (m) r.sitekey = decodeURIComponent(m[1]);
-            }
-            // action（v3 用）
-            const sc = Array.from(document.querySelectorAll('script')).find(s => /grecaptcha\.execute/.test(s.textContent || ''));
-            if (sc) { const m = (sc.textContent || '').match(/grecaptcha\.execute\([^,]+,\s*\{action:\s*['"]([^'"]+)['"]/); if (m) r.action = m[1]; }
-            // 判断 v3：有 grecaptcha.execute 且无可见 checkbox
-            if (sc && !document.querySelector('.g-recaptcha')) r.type = "recaptcha_v3";
-          }
-          // Cloudflare Turnstile
-          if (document.querySelector('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [class*="turnstile" i]')) {
-            r.type = "turnstile";
-            const c = document.querySelector('[data-sitekey]');
-            if (c) r.sitekey = c.getAttribute("data-sitekey");
-            const i = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            if (i) { const m = i.src.match(/sitekey=([^&]+)/); if (m) r.sitekey = decodeURIComponent(m[1]); }
-          }
-          // hCaptcha
-          if (document.querySelector('iframe[src*="hcaptcha.com"], .h-captcha')) r.type = r.type || "hcaptcha";
-          return r;
-        });
-
-        let sitekey = probe.sitekey;
-        if (!sitekey && probe.type === "turnstile") {
+        let sitekey = secondary.sitekey;
+        // reCAPTCHA 没取到 sitekey → 兜底（实测 ZenMux 二次验证 reCAPTCHA sitekey）
+        if (!sitekey && (secondary.type === "recaptcha" || secondary.type === "recaptcha_v3")) {
+          sitekey = "6LdN_REsAAAAAKSlH2k4VNXo";  // 日志实测的二次验证 sitekey
+          taskLog(taskId, `⚠ 未从页面取到 reCAPTCHA sitekey，使用兜底值`);
+        }
+        // Turnstile 兜底
+        if (!sitekey && secondary.type === "turnstile") {
           const cfRequests = [];
           const handler = req => { if (req.url().includes('challenges.cloudflare.com/turnstile')) cfRequests.push(req.url()); };
           page.on('request', handler); await sleep(2000); page.off('request', handler);
           for (const url of cfRequests) { const m = url.match(/\/0x[A-Fa-f0-9]{20,}\//); if (m) { sitekey = m[0].replace(/\//g, ''); break; } }
+          if (!sitekey) sitekey = "0x4AAAAAAB3vWB8HhhtIcASj";
         }
-        if (!sitekey && probe.type === "turnstile") sitekey = "0x4AAAAAAB3vWB8HhhtIcASj";
-        if (!sitekey && probe.type === "recaptcha") sitekey = "6Le-wvkSVVABBPBdvLkUkqXpHcKk1mGpHw"; // 通用兜底，实际应从页面取
 
-        const solved = await solveSecondaryCaptcha(page, taskId, probe, sitekey);
-        // 打码成功后，等页面反应并点提交
+        taskLog(taskId, `二次验证类型: ${secondary.type}, sitekey: ${(sitekey || "").slice(0, 24)}...`);
+        await solveSecondaryCaptcha(page, taskId, secondary, sitekey);
         await sleep(1500);
         await clickSecondarySubmit(page, taskId);
       } catch (e) {
         taskLog(taskId, `二次打码失败: ${e.message}`);
       }
     } else {
-      taskLog(taskId, "✓ 未检测到二次 Turnstile，无需二次打码");
-    }
-
-    // ---- 10. 等待登录 ----
-    let loginOk = false;
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline) {
-      await sleep(2000);
-      const url = page.url();
-      const onOAuth = url.includes("accounts.google.com") || url.includes("github.com/login");
-      if (onOAuth) break;
-      // 注意：/verify 是验证码页，不是登录成功页，不能算登录完成
-      if (url.includes("/chat") || url.includes("/settings") ||
-        (url.includes("zenmux.ai") && !url.includes("/sign") && !url.includes("/login") && !url.includes("/verify"))) {
-        loginOk = true;
-        break;
-      }
-    }
-
-    if (loginOk) {
-      const cookies = await context.cookies();
-      const sessionId = cookies.find((c) => c.name === "sessionId");
-
-      // 二次确认：sessionId 必须存在，且调用 referral/info 不报 401，才算真正登录成功
-      // 避免误停在 /verify 等中间页时拿到死 session
-      let trulyLoggedIn = !!sessionId?.value;
-      if (trulyLoggedIn) {
-        try {
-          const probe = await page.evaluate(async () => {
-            const r = await fetch("/api/referral/info", { headers: { "Accept": "application/json" }, credentials: "include" });
-            return r.ok ? await r.json() : { _status: r.status };
-          });
-          if (probe && probe._status === 401) {
-            trulyLoggedIn = false;
-            taskLog(taskId, `⚠ 拿到 sessionId 但 referral/info 返回 401，登录未真正完成`);
-          }
-        } catch (e) {}
-      }
-
-      if (!trulyLoggedIn) {
-        result.error = sessionId?.value ? "登录态无效（session 未生效）" : "登录流程未完成（无 sessionId）";
-        taskLog(taskId, `❌ 注册失败: ${email} (${result.error})`);
-        // 失败时截图，便于排查"验证码对却登录失败"
-        await debugScreenshot(page, email, "login_invalid", taskId);
+      if (loginDetectedEarly) {
+        taskLog(taskId, "✓ 已登录成功，无需二次验证");
       } else {
-        const storageState = await context.storageState();
-        const statePath = path.join(SESSIONS_DIR, `${email.replace(/[@.]/g, "_")}.json`);
-        fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-        fs.writeFileSync(statePath, JSON.stringify(storageState, null, 2));
-
-        result.success = true;
-        result.sessionId = sessionId?.value || null;
-        taskLog(taskId, `✅ 注册成功: ${email} | Session: ${result.sessionId}`);
-
-        // 保存结果
-        fs.mkdirSync(RESULTS_DIR, { recursive: true });
-        const summaryPath = path.join(RESULTS_DIR, "summary.jsonl");
-        fs.appendFileSync(summaryPath, JSON.stringify({
-          email, timestamp: new Date().toISOString(), success: true,
-          sessionId: result.sessionId, statePath,
-        }) + "\n");
-
-        // 自动提取该账号的邀请码（用于后续轮换）
-        await extractInviteCode(page, email, taskId);
-
-        // 自动创建 API key：Pay API（按量付费 sk-ai-v1）+ Platform API（平台管理 sk-mg-v1）
-        await ensureApiKey(page, email, taskId, "pay");
-        await ensureApiKey(page, email, taskId, "platform");
+        taskLog(taskId, secondary && secondary.hasToken ? "✓ 二次验证已自动通过，无需打码" : "⚠ 60s 内未检测到二次验证，也未登录成功，继续等待登录");
       }
+    }
+
+    // ---- 10. 等待登录（硬判定：referral/info 返回 200 才算真正登录成功） ----
+    // 不用 URL / cookie 判断（ZenMux 是弹窗登录，URL 不变，cookie 可能是无效 session）。
+    // 唯一硬证据：/api/referral/info 返回 200。轮询最多 60s。
+    let trulyLoggedIn = false;
+    let sessionId = null;
+    const loginDeadline = Date.now() + 60_000;
+    while (Date.now() < loginDeadline) {
+      await sleep(2000);
+      try {
+        const probe = await page.evaluate(async () => {
+          const r = await fetch("/api/referral/info", { headers: { "Accept": "application/json" }, credentials: "include" });
+          return r.ok ? { ok: true } : { ok: false, status: r.status };
+        });
+        if (probe && probe.ok) { trulyLoggedIn = true; break; }
+      } catch (e) {}
+    }
+    if (trulyLoggedIn) {
+      const cookies = await context.cookies();
+      sessionId = cookies.find((c) => c.name === "sessionId");
+    }
+
+    if (trulyLoggedIn) {
+      const storageState = await context.storageState();
+      const statePath = path.join(SESSIONS_DIR, `${email.replace(/[@.]/g, "_")}.json`);
+      fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+      fs.writeFileSync(statePath, JSON.stringify(storageState, null, 2));
+
+      result.success = true;
+      result.sessionId = sessionId?.value || null;
+      taskLog(taskId, `✅ 注册成功: ${email} | Session: ${result.sessionId}`);
+
+      // 保存结果
+      fs.mkdirSync(RESULTS_DIR, { recursive: true });
+      const summaryPath = path.join(RESULTS_DIR, "summary.jsonl");
+      fs.appendFileSync(summaryPath, JSON.stringify({
+        email, timestamp: new Date().toISOString(), success: true,
+        sessionId: result.sessionId, statePath,
+      }) + "\n");
+
+      // 自动提取该账号的邀请码（用于后续轮换）
+      await extractInviteCode(page, email, taskId);
+
+      // 自动创建 API key：Pay API（按量付费 sk-ai-v1）+ Platform API（平台管理 sk-mg-v1）
+      await ensureApiKey(page, email, taskId, "pay");
+      await ensureApiKey(page, email, taskId, "platform");
     } else {
-      result.error = "登录流程未完成";
-      taskLog(taskId, `❌ 注册失败: ${email}`);
-      // 失败时截图（停在哪个页面、有没有错误提示一目了然）
-      await debugScreenshot(page, email, "login_timeout", taskId);
+      result.error = "登录未完成（referral/info 未返回 200）";
+      taskLog(taskId, `❌ 注册失败: ${email} (${result.error})`);
     }
   } catch (e) {
     result.error = e.message;
     taskLog(taskId, `❌ 注册出错: ${e.message}`);
-    try { await debugScreenshot(page, email, "exception", taskId); } catch (_) {}
   } finally {
     // 移除注册中状态
     registeringAccounts.delete(email.toLowerCase());
