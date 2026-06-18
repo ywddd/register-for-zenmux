@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZenMux 注册管理面板</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+    --text: #e4e4e7; --text2: #a1a1aa; --accent: #6366f1;
+    --green: #22c55e; --red: #ef4444; --yellow: #eab308; --blue: #3b82f6;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+  /* Header */
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .header h1 { font-size: 22px; font-weight: 600; }
+  .header h1 span { color: var(--accent); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .status-dot.ok { background: var(--green); } .status-dot.err { background: var(--red); }
+
+  /* Cards */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  .card-title { font-size: 15px; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .card-title .icon { font-size: 18px; }
+
+  /* Grid */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  @media (max-width: 768px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+
+  /* Stat cards */
+  .stat { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; text-align: center; }
+  .stat .num { font-size: 28px; font-weight: 700; color: var(--accent); }
+  .stat .label { font-size: 12px; color: var(--text2); margin-top: 4px; }
+
+  /* Buttons */
+  .btn { padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 500; transition: all .15s; }
+  .btn:active { transform: scale(.97); }
+  .btn-primary { background: var(--accent); color: #fff; } .btn-primary:hover { background: #5558e6; }
+  .btn-danger { background: var(--red); color: #fff; } .btn-danger:hover { background: #dc2626; }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* Table */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 10px 12px; color: var(--text2); font-weight: 500; border-bottom: 1px solid var(--border); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: rgba(99,102,241,.04); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-ok { background: rgba(34,197,94,.15); color: var(--green); }
+  .badge-pending { background: rgba(234,179,8,.15); color: var(--yellow); }
+  .badge-registering { background: rgba(59,130,246,.15); color: var(--blue); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
+
+  /* Inputs */
+  input, textarea { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; color: var(--text); font-size: 13px; width: 100%; outline: none; }
+  input:focus, textarea:focus { border-color: var(--accent); }
+  label { display: block; font-size: 12px; color: var(--text2); margin-bottom: 4px; font-weight: 500; }
+  .field { margin-bottom: 12px; }
+
+  /* Log area */
+  .log-area { background: #000; border: 1px solid var(--border); border-radius: 8px; padding: 12px; max-height: 400px; overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 12px; line-height: 1.7; }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line .ts { color: #666; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 8px 16px; cursor: pointer; font-size: 13px; color: var(--text2); border-bottom: 2px solid transparent; transition: all .15s; }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab:hover { color: var(--text); }
+  .tab-content { display: none; } .tab-content.active { display: block; }
+
+  /* Modal */
+  .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; align-items: center; justify-content: center; }
+  .modal-bg.show { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; width: 90%; max-width: 500px; }
+  .modal h3 { margin-bottom: 16px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+  /* Import textarea */
+  .import-area { min-height: 120px; font-family: monospace; font-size: 12px; resize: vertical; }
+
+  .empty { text-align: center; color: var(--text2); padding: 40px 0; font-size: 14px; }
+  .inline-form { display: flex; gap: 8px; align-items: flex-end; }
+  .inline-form .field { flex: 1; margin-bottom: 0; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <h1>⚡ <span>ZenMux</span> 注册管理面板</h1>
+    <div>
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText" style="font-size:13px;color:var(--text2)">连接中...</span>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="grid3" style="margin-bottom:16px">
+    <div class="stat"><div class="num" id="statAccounts">-</div><div class="label">总账号</div></div>
+    <div class="stat"><div class="num" id="statRegistered" style="color:var(--green)">-</div><div class="label">已注册</div></div>
+    <div class="stat"><div class="num" id="statRegistering" style="color:var(--blue)">-</div><div class="label">注册中</div></div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" data-tab="accounts">📋 账号管理</div>
+    <div class="tab" data-tab="register">🚀 注册</div>
+    <div class="tab" data-tab="keys">🔑 API Keys</div>
+    <div class="tab" data-tab="logs">📜 日志</div>
+    <div class="tab" data-tab="settings">⚙️ 设置</div>
+  </div>
+
+  <!-- Tab: Accounts -->
+  <div class="tab-content active" id="tab-accounts">
+    <div class="card">
+      <div class="card-title"><span class="icon">👤</span> 账号列表</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>邮箱</th><th>类型</th><th>状态</th><th>Session</th><th>操作</th></tr></thead>
+          <tbody id="accountsBody"></tbody>
+        </table>
+      </div>
+      <div id="accountsEmpty" class="empty" style="display:none">暂无账号，请添加或批量导入</div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title"><span class="icon">➕</span> 添加账号</div>
+        <div class="field"><label>邮箱</label><input id="addEmail" placeholder="user@hotmail.com"></div>
+        <div class="field"><label>client_id</label><input id="addClientId" placeholder="Microsoft OAuth client_id"></div>
+        <div class="field"><label>refresh_token</label><input id="addRefreshToken" placeholder="Microsoft OAuth refresh_token"></div>
+        <div class="field"><label>密码 (可选)</label><input id="addPassword" type="password" placeholder="可选"></div>
+        <button class="btn btn-primary" onclick="addAccount()">添加</button>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">📥</span> 批量导入</div>
+        <div class="field">
+          <textarea id="importArea" class="import-area" placeholder="支持两种格式：
+
+1) ---- 分隔（每行一个账号）：
+邮箱----密码----client_id----refresh_token
+
+2) JSON 数组：
+[{&quot;email&quot;:&quot;...&quot;,&quot;client_id&quot;:&quot;...&quot;,&quot;refresh_token&quot;:&quot;...&quot;}]"></textarea>
+          <p style="font-size:12px;color:var(--text2);margin-top:6px">分隔格式每行一个账号，字段顺序：邮箱 / 密码 / client_id / refresh_token（密码可留空，则按 邮箱 / client_id / refresh_token 三段）</p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-primary" onclick="importAccounts()">导入</button>
+          <input type="file" id="importFile" accept=".txt,.json" style="display:none" onchange="onImportFile(event)">
+          <button class="btn btn-sm" style="background:var(--border)" onclick="document.getElementById('importFile').click()">📎 上传 txt/json 文件</button>
+          <span id="importFileName" style="font-size:12px;color:var(--text2)"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Register -->
+  <div class="tab-content" id="tab-register">
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title"><span class="icon">🚀</span> 触发注册</div>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:14px">
+          选择一个账号注册，或批量注册所有未注册的账号。注册时会从邀请码列表中随机选择一个。
+        </p>
+        <div class="field">
+          <label>选择账号 (留空 = 全部未注册)</label>
+          <select id="regEmail" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;width:100%">
+            <option value="">-- 全部未注册 --</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" id="btnRegister" onclick="startRegister()">开始注册</button>
+        <button class="btn btn-danger" id="btnStop" onclick="stopRegister()" style="margin-left:8px;display:none">停止</button>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">📊</span> 注册状态</div>
+        <div id="regStatus" style="font-size:13px;color:var(--text2)">空闲</div>
+        <div id="regTaskLogs" class="log-area" style="margin-top:12px;max-height:300px;display:none"></div>
+      </div>
+    </div>
+
+    <!-- Results -->
+    <div class="card" style="margin-top:16px">
+      <div class="card-title"><span class="icon">📈</span> 注册结果</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>邮箱</th><th>时间</th><th>状态</th><th>Session</th></tr></thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+      <div id="resultsEmpty" class="empty" style="display:none">暂无注册记录</div>
+    </div>
+  </div>
+
+  <!-- Tab: Logs -->
+  <div class="tab-content" id="tab-logs">
+    <div class="card">
+      <div class="card-title"><span class="icon">📜</span> 实时日志</div>
+      <div id="logArea" class="log-area" style="min-height:300px"></div>
+    </div>
+  </div>
+
+  <!-- Tab: API Keys -->
+  <div class="tab-content" id="tab-keys">
+    <div class="card">
+      <div class="card-title"><span class="icon">🔑</span> API Keys 管理</div>
+      <p style="font-size:13px;color:var(--text2);margin-bottom:14px">
+        每个账号注册成功后会自动创建两个 key：<b>Pay API</b>（按量付费 sk-ai-v1）和 <b>Platform API</b>（平台管理 sk-mg-v1）。也可对已注册账号手动创建。
+      </p>
+      <div class="field">
+        <label>选择已注册账号</label>
+        <select id="keyEmail" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;width:100%">
+          <option value="">-- 选择账号 --</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn btn-primary btn-sm" onclick="ensureKey('pay')">创建/检查 Pay API</button>
+        <button class="btn btn-primary btn-sm" onclick="ensureKey('platform')">创建/检查 Platform API</button>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="loadApiKeys()">刷新列表</button>
+      </div>
+      <div id="keyEmpty" class="empty" style="display:none">暂无 API key</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span class="icon">📋</span> 已保存的 API Keys</div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('pay')">⬇ 导出 Pay Key (txt)</button>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('platform')">⬇ 导出 Platform Key (txt)</button>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('all')">⬇ 导出全部 (txt)</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>邮箱</th><th>类型</th><th>名称</th><th>Token</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="apiKeysBody"></tbody>
+        </table>
+      </div>
+      <div id="apiKeysEmpty" class="empty" style="display:none">暂无 API key，注册账号后会自动创建</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span class="icon">🚚</span> 导入 gpt-load</div>
+      <p style="font-size:13px;color:var(--text2);margin-bottom:14px">
+        把已保存的 <b>Pay Key</b>（sk-ai-v1）一键导入本机 gpt-load 的指定分组。注册成功后也可自动导入（需在 .env 配置 <code>GPTLOAD_PAY_GROUP_ID</code>）。
+      </p>
+      <div class="field">
+        <label>gpt-load 分组</label>
+        <select id="gptloadGroup" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;width:100%">
+          <option value="">-- 加载中 --</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" onclick="importToGptLoad('pay')">导入 Pay Key 到 gpt-load</button>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="loadGptLoadGroups()">刷新分组</button>
+        <span id="gptloadStatus" style="font-size:12px;color:var(--text2);align-self:center"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Settings -->
+  <div class="tab-content" id="tab-settings">
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title"><span class="icon">🔗</span> 邀请码配置</div>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:14px">手动配置的邀请码（多个用逗号分隔）。注册时会与自动提取的邀请码合并，随机选一个。</p>
+        <div class="field">
+          <label>手动邀请码 (env)</label>
+          <input id="cfgInviteCodes" placeholder="CODE1,CODE2,CODE3">
+        </div>
+        <button class="btn btn-primary" onclick="saveConfig()">保存</button>
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px">自动提取的邀请码 (<span id="autoCodeCount">0</span> 个)</div>
+          <div id="autoCodesList" style="display:flex;flex-wrap:wrap;gap:6px;min-height:30px"></div>
+          <p style="font-size:12px;color:var(--text2);margin-top:8px">
+            新账号注册成功后会自动提取邀请码并加入轮换。共 <span id="allCodeCount" style="color:var(--accent);font-weight:600">0</span> 个可用。
+          </p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="icon">🔧</span> 服务状态</div>
+        <div id="serviceStatus" style="font-size:13px">
+          <p>CapSolver 余额: <span id="csBalance">查询中...</span></p>
+          <p style="margin-top:8px">hotmail_helper: <span id="hmStatus">查询中...</span></p>
+          <p style="margin-top:8px">浏览器模式: <span id="cfgHeadless">-</span></p>
+          <p style="margin-top:8px">CapSolver Key: <span id="cfgCsKey">-</span></p>
+        </div>
+        <button class="btn btn-primary" style="margin-top:14px" onclick="refreshStatus()">刷新状态</button>
+
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px">手动提取邀请码</div>
+          <p style="font-size:12px;color:var(--text2);margin-bottom:8px">对已注册账号重新提取邀请码</p>
+          <select id="extractEmail" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;width:100%;margin-bottom:8px">
+            <option value="">-- 选择已注册账号 --</option>
+          </select>
+          <button class="btn btn-primary btn-sm" onclick="extractCode()">提取邀请码</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Delete confirm modal -->
+<div class="modal-bg" id="deleteModal">
+  <div class="modal">
+    <h3>确认删除</h3>
+    <p style="font-size:14px;color:var(--text2)" id="deleteMsg">确定删除？</p>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()" style="background:var(--border)">取消</button>
+      <button class="btn btn-danger" id="deleteConfirm">删除</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let lastLogSeq = 0;
+let polling = null;
+let logPolling = null;
+
+// ---- Tabs ----
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+  });
+});
+
+// ---- API helpers ----
+async function api(path, opts = {}) {
+  const resp = await fetch(API + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  return resp.json();
+}
+
+// ---- Load data ----
+async function refreshAll() {
+  await Promise.all([loadAccounts(), loadResults(), loadConfig(), refreshStatus()]);
+}
+
+async function loadAccounts() {
+  const data = await api('/api/accounts');
+  if (!data.ok) return;
+  const accounts = data.accounts || [];
+  const body = document.getElementById('accountsBody');
+  const empty = document.getElementById('accountsEmpty');
+  const regSel = document.getElementById('regEmail');
+
+  document.getElementById('statAccounts').textContent = accounts.length;
+  document.getElementById('statRegistered').textContent = accounts.filter(a => a.registered).length;
+  document.getElementById('statRegistering').textContent = accounts.filter(a => a.registering).length;
+
+  if (accounts.length === 0) {
+    body.innerHTML = '';
+    empty.style.display = 'block';
+  } else {
+    empty.style.display = 'none';
+    body.innerHTML = accounts.map(a => {
+      let statusBadge = '';
+      if (a.skip) {
+        statusBadge = '<span class="badge" style="background:rgba(100,116,139,.15);color:#64748b">⏭ 已跳过</span>';
+      } else if (a.registering) {
+        statusBadge = '<span class="badge badge-registering">⏳ 注册中</span>';
+      } else if (a.registered) {
+        statusBadge = '<span class="badge badge-ok">✓ 已注册</span>';
+      } else {
+        statusBadge = '<span class="badge badge-pending">未注册</span>';
+      }
+      // 跳过的账号：从待注册列表移除；点恢复加回
+      const skipBtn = a.skip
+        ? `<button class="btn btn-sm btn-primary" onclick="toggleSkip('${esc(a.email)}', false)">恢复</button>`
+        : `<button class="btn btn-sm" style="background:var(--border)" onclick="toggleSkip('${esc(a.email)}', true)">移出待注册</button>`;
+      const rowStyle = a.skip ? 'opacity:.5' : '';
+      return `
+      <tr style="${rowStyle}">
+        <td>${esc(a.email)}</td>
+        <td>${esc(a.type || 'microsoft')}</td>
+        <td>${statusBadge}</td>
+        <td style="font-family:monospace;font-size:11px">${a.sessionId ? esc(a.sessionId.slice(0, 16)) + '...' : '-'}</td>
+        <td>
+          ${skipBtn}
+          ${a.registered ? `<button class="btn btn-sm btn-danger" onclick="deleteSession('${esc(a.email)}')" style="margin-left:4px">清除Session</button>` : ''}
+          ${a.registering ? '' : `<button class="btn btn-sm btn-danger" onclick="confirmDeleteAccount('${esc(a.email)}')" style="margin-left:4px">删除</button>`}
+        </td>
+      </tr>
+    `}).join('');
+  }
+
+  // Update register dropdown
+  const currentVal = regSel.value;
+  regSel.innerHTML = '<option value="">-- 全部未注册 --</option>';
+  accounts.forEach(a => {
+    let label = esc(a.email);
+    if (a.registering) label += ' (注册中)';
+    else if (a.registered) label += ' (已注册)';
+    regSel.innerHTML += `<option value="${esc(a.email)}"${a.registering ? ' disabled' : ''}>${label}</option>`;
+  });
+  regSel.value = currentVal;
+}
+
+// 切换账号跳过注册
+async function toggleSkip(email, skip) {
+  const data = await api(`/api/accounts/${encodeURIComponent(email)}`, { method: 'PATCH', body: JSON.stringify({ skip }) });
+  if (data.ok) {
+    loadAccounts();
+  } else {
+    alert(data.error || '操作失败');
+  }
+}
+
+async function loadResults() {
+  const data = await api('/api/results');
+  if (!data.ok) return;
+  const results = data.results || [];
+  document.getElementById('statResults').textContent = results.length;
+  const body = document.getElementById('resultsBody');
+  const empty = document.getElementById('resultsEmpty');
+
+  if (results.length === 0) {
+    body.innerHTML = '';
+    empty.style.display = 'block';
+  } else {
+    empty.style.display = 'none';
+    body.innerHTML = results.slice().reverse().slice(0, 50).map(r => `
+      <tr>
+        <td>${esc(r.email)}</td>
+        <td style="font-size:12px">${r.timestamp ? new Date(r.timestamp).toLocaleString('zh-CN') : '-'}</td>
+        <td>${r.success ? '<span class="badge badge-ok">成功</span>' : '<span class="badge badge-pending" style="background:rgba(239,68,68,.15);color:var(--red)">失败</span>'}</td>
+        <td style="font-family:monospace;font-size:11px">${r.sessionId ? esc(r.sessionId.slice(0, 16)) + '...' : '-'}</td>
+      </tr>
+    `).join('');
+  }
+}
+
+async function loadConfig() {
+  const data = await api('/api/config');
+  if (!data.ok) return;
+  const cfg = data.config;
+  document.getElementById('cfgInviteCodes').value = (cfg.inviteCodes || []).join(',');
+  document.getElementById('cfgHeadless').textContent = cfg.headless ? '无头模式' : '有头模式';
+  document.getElementById('cfgCsKey').textContent = cfg.capsolverKey || '未配置';
+
+  // 自动提取的邀请码
+  const autoCodes = cfg.autoInviteCodes || [];
+  const allCodes = cfg.allInviteCodes || [];
+  document.getElementById('autoCodeCount').textContent = autoCodes.length;
+  document.getElementById('allCodeCount').textContent = allCodes.length;
+  const list = document.getElementById('autoCodesList');
+  if (autoCodes.length === 0) {
+    list.innerHTML = '<span style="font-size:12px;color:var(--text2)">暂无自动提取的邀请码</span>';
+  } else {
+    list.innerHTML = autoCodes.map(c => `<span class="badge badge-ok" style="cursor:pointer" onclick="deleteCode('${esc(c)}')" title="点击删除">${esc(c)} ✕</span>`).join('');
+  }
+
+  // 加载已注册账号到提取下拉框
+  loadExtractDropdown();
+}
+
+async function loadExtractDropdown() {
+  try {
+    const data = await api('/api/accounts');
+    if (!data.ok) return;
+    const registered = (data.accounts || []).filter(a => a.registered && !a.registering);
+    const sel = document.getElementById('extractEmail');
+    const current = sel.value;
+    sel.innerHTML = '<option value="">-- 选择已注册账号 --</option>';
+    registered.forEach(a => {
+      sel.innerHTML += `<option value="${esc(a.email)}">${esc(a.email)}</option>`;
+    });
+    sel.value = current;
+  } catch {}
+}
+
+async function deleteCode(code) {
+  if (!confirm(`删除邀请码 ${code}？`)) return;
+  await api(`/api/invite-codes/${encodeURIComponent(code)}`, { method: 'DELETE' });
+  loadConfig();
+}
+
+async function extractCode() {
+  const email = document.getElementById('extractEmail').value;
+  if (!email) return alert('请选择账号');
+  const data = await api('/api/invite-codes/extract', { method: 'POST', body: JSON.stringify({ email }) });
+  if (data.ok) {
+    alert('开始提取，请查看注册日志');
+    // 切换到注册标签查看日志
+    document.querySelector('.tab[data-tab="register"]').click();
+    startTaskPolling();
+  } else {
+    alert(data.error || '提取失败');
+  }
+}
+
+// ---- API Keys ----
+async function loadApiKeys() {
+  try {
+    const data = await api('/api/api-keys');
+    const keys = data.ok ? (data.keys || []) : [];
+    const body = document.getElementById('apiKeysBody');
+    const empty = document.getElementById('apiKeysEmpty');
+    if (keys.length === 0) { body.innerHTML = ''; empty.style.display = 'block'; }
+    else {
+      empty.style.display = 'none';
+      body.innerHTML = keys.map(k => `
+        <tr>
+          <td>${esc(k.email)}</td>
+          <td>${k.keyType === 'platform' ? '<span class="badge" style="background:rgba(168,85,247,.15);color:#a855f7">Platform</span>' : '<span class="badge" style="background:rgba(59,130,246,.15);color:var(--blue)">Pay</span>'}</td>
+          <td>${esc(k.name || '-')}</td>
+          <td style="font-family:monospace;font-size:11px">${k.token ? esc(k.token.slice(0, 24)) + '...' : '-'}</td>
+          <td>${k.enabled !== false ? '<span class="badge badge-ok">启用</span>' : '<span class="badge badge-pending">禁用</span>'}</td>
+          <td>${k.token ? `<button class="btn btn-sm" style="background:var(--border)" onclick="copyToken('${esc(k.token)}')">复制</button>` : ''}</td>
+        </tr>`).join('');
+    }
+    // 更新下拉框
+    await loadKeyDropdown();
+  } catch {}
+}
+
+async function loadKeyDropdown() {
+  try {
+    const data = await api('/api/accounts');
+    if (!data.ok) return;
+    const registered = (data.accounts || []).filter(a => a.registered);
+    const sel = document.getElementById('keyEmail');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">-- 选择账号 --</option>';
+    registered.forEach(a => { sel.innerHTML += `<option value="${esc(a.email)}">${esc(a.email)}</option>`; });
+    sel.value = cur;
+  } catch {}
+}
+
+function copyToken(token) {
+  navigator.clipboard.writeText(token).then(() => {
+    alert('Token 已复制到剪贴板');
+  }).catch(() => alert('复制失败，请手动复制'));
+}
+
+async function ensureKey(type) {
+  const email = document.getElementById('keyEmail').value;
+  if (!email) return alert('请选择账号');
+  const data = await api('/api/api-keys/ensure', { method: 'POST', body: JSON.stringify({ email, type }) });
+  if (data.ok) {
+    alert(`开始创建/检查 ${type} API key，请查看日志`);
+    document.querySelector('.tab[data-tab="register"]').click();
+    startTaskPolling();
+    // 任务完成后刷新 key 列表
+    const checkDone = setInterval(async () => {
+      const st = await api('/api/register/status');
+      if (st.ok && !st.registering) {
+        clearInterval(checkDone);
+        loadApiKeys();
+      }
+    }, 2000);
+  } else {
+    alert(data.error || '操作失败');
+  }
+}
+
+// 导出 key 为 txt
+function exportKeys(type) {
+  window.location.href = `/api/api-keys/export?type=${type}`;
+}
+
+// gpt-load 分组列表
+async function loadGptLoadGroups() {
+  const sel = document.getElementById('gptloadGroup');
+  const status = document.getElementById('gptloadStatus');
+  sel.innerHTML = '<option value="">-- 加载中 --</option>';
+  try {
+    const data = await api('/api/gptload/groups');
+    if (data.ok && data.groups) {
+      sel.innerHTML = '<option value="">-- 选择分组 --</option>';
+      data.groups.forEach(g => { sel.innerHTML += `<option value="${g.id}">${esc(g.name)} (id=${g.id})</option>`; });
+      status.textContent = `共 ${data.groups.length} 个分组`;
+    } else {
+      sel.innerHTML = '<option value="">-- 无 --</option>';
+      status.textContent = data.error || '加载失败';
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="">-- 无 --</option>';
+    status.textContent = '加载失败: ' + e.message;
+  }
+}
+
+// 导入 pay key 到 gpt-load
+async function importToGptLoad(type) {
+  const groupId = document.getElementById('gptloadGroup').value;
+  if (!groupId) return alert('请先选择 gpt-load 分组');
+  const status = document.getElementById('gptloadStatus');
+  status.textContent = '导入中...';
+  const data = await api('/api/gptload/import', { method: 'POST', body: JSON.stringify({ group_id: parseInt(groupId), type }) });
+  if (data.ok) {
+    status.textContent = `✓ 新增 ${data.added} 个 (重复忽略 ${data.ignored})，分组共 ${data.total}`;
+    alert(`导入完成：新增 ${data.added} 个，重复忽略 ${data.ignored} 个，分组共 ${data.total} 个`);
+  } else {
+    status.textContent = '✗ ' + (data.error || '导入失败');
+    alert(data.error || '导入失败');
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const bal = await api('/api/capsolver/balance');
+    document.getElementById('csBalance').textContent = bal.ok ? `$${bal.balance} ${bal.currency}` : (bal.error || '查询失败');
+  } catch { document.getElementById('csBalance').textContent = '查询失败'; }
+
+  try {
+    const hm = await api('/api/hotmail/status');
+    document.getElementById('hmStatus').textContent = hm.ok ? '✓ 运行中' : '✗ ' + (hm.error || '未运行');
+    document.getElementById('hmStatus').style.color = hm.ok ? 'var(--green)' : 'var(--red)';
+  } catch { document.getElementById('hmStatus').textContent = '✗ 未运行'; document.getElementById('hmStatus').style.color = 'var(--red)'; }
+}
+
+// ---- Actions ----
+async function addAccount() {
+  const email = document.getElementById('addEmail').value.trim();
+  const client_id = document.getElementById('addClientId').value.trim();
+  const refresh_token = document.getElementById('addRefreshToken').value.trim();
+  const password = document.getElementById('addPassword').value;
+  if (!email || !client_id || !refresh_token) return alert('请填写必要字段');
+  const data = await api('/api/accounts', { method: 'POST', body: JSON.stringify({ email, client_id, refresh_token, password }) });
+  if (data.ok) {
+    document.getElementById('addEmail').value = '';
+    document.getElementById('addClientId').value = '';
+    document.getElementById('addRefreshToken').value = '';
+    document.getElementById('addPassword').value = '';
+    loadAccounts();
+  } else {
+    alert(data.error || '添加失败');
+  }
+}
+
+function parseAccountsText(text) {
+  const accounts = [];
+  if (!text) return accounts;
+  // 支持 ---- 分隔格式（每行一个账号）
+  if (text.includes('----')) {
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      const parts = line.split('----').map(s => s.trim());
+      let email, password = '', client_id, refresh_token;
+      if (parts.length >= 4) {
+        [email, password, client_id, refresh_token] = parts;
+      } else if (parts.length === 3) {
+        [email, client_id, refresh_token] = parts;
+      } else {
+        continue;
+      }
+      if (email && client_id && refresh_token) {
+        accounts.push({ email, password, client_id, refresh_token });
+      }
+    }
+  } else {
+    // JSON 数组
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) throw new Error('需要数组格式');
+    return parsed;
+  }
+  return accounts;
+}
+
+function onImportFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  document.getElementById('importFileName').textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    document.getElementById('importArea').value = e.target.result;
+  };
+  reader.readAsText(file);
+}
+
+async function importAccounts() {
+  const text = document.getElementById('importArea').value.trim();
+  if (!text) return alert('请输入账号或上传文件');
+  let accounts;
+  try {
+    accounts = parseAccountsText(text);
+  } catch (err) {
+    return alert('解析失败：' + (err.message || '格式错误'));
+  }
+  if (!accounts.length) return alert('未解析到有效账号，请检查格式：邮箱----密码----client_id----refresh_token');
+  const data = await api('/api/accounts/import', { method: 'POST', body: JSON.stringify({ accounts }) });
+  if (data.ok) {
+    alert(`成功导入 ${data.added} 个账号`);
+    document.getElementById('importArea').value = '';
+    loadAccounts();
+  } else {
+    alert(data.error || '导入失败');
+  }
+}
+
+function confirmDeleteAccount(email) {
+  document.getElementById('deleteMsg').textContent = `确定删除账号 ${email}？此操作不可撤销。`;
+  document.getElementById('deleteModal').classList.add('show');
+  document.getElementById('deleteConfirm').onclick = async () => {
+    await api(`/api/accounts/${encodeURIComponent(email)}`, { method: 'DELETE' });
+    closeModal();
+    loadAccounts();
+  };
+}
+
+function closeModal() { document.getElementById('deleteModal').classList.remove('show'); }
+
+async function deleteSession(email) {
+  if (!confirm(`清除 ${email} 的 session？`)) return;
+  await api(`/api/sessions/${encodeURIComponent(email)}`, { method: 'DELETE' });
+  loadAccounts();
+}
+
+async function saveConfig() {
+  const codesStr = document.getElementById('cfgInviteCodes').value.trim();
+  const inviteCodes = codesStr ? codesStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+  const data = await api('/api/config', { method: 'POST', body: JSON.stringify({ inviteCodes }) });
+  if (data.ok) alert('配置已保存');
+  loadConfig();
+}
+
+async function startRegister() {
+  const email = document.getElementById('regEmail').value;
+  const body = email ? { email } : {};
+  const data = await api('/api/register', { method: 'POST', body: JSON.stringify(body) });
+  if (data.ok) {
+    document.getElementById('btnRegister').disabled = true;
+    document.getElementById('btnStop').style.display = 'inline-block';
+    document.getElementById('regTaskLogs').style.display = 'block';
+    document.getElementById('regStatus').innerHTML = '<span style="color:var(--yellow)">⏳ 注册进行中...</span>';
+    startTaskPolling();
+  } else {
+    alert(data.error || '启动失败');
+  }
+}
+
+async function stopRegister() {
+  await api('/api/register/stop', { method: 'POST' });
+  document.getElementById('btnRegister').disabled = false;
+  document.getElementById('btnStop').style.display = 'none';
+  document.getElementById('regStatus').innerHTML = '<span style="color:var(--text2)">已停止</span>';
+}
+
+function startTaskPolling() {
+  if (polling) clearInterval(polling);
+  polling = setInterval(async () => {
+    const data = await api('/api/register/status');
+    if (!data.ok) return;
+    if (!data.registering) {
+      clearInterval(polling);
+      polling = null;
+      document.getElementById('btnRegister').disabled = false;
+      document.getElementById('btnStop').style.display = 'none';
+      document.getElementById('regStatus').innerHTML = '<span style="color:var(--green)">✅ 空闲</span>';
+      loadAccounts();
+      loadResults();
+    }
+    const logEl = document.getElementById('regTaskLogs');
+    const logs = data.taskLogs || [];
+    logEl.innerHTML = logs.map(l => `<div class="log-line">${esc(l)}</div>`).join('');
+    logEl.scrollTop = logEl.scrollHeight;
+  }, 1500);
+}
+
+// ---- Log polling ----
+function startLogPolling() {
+  if (logPolling) clearInterval(logPolling);
+  logPolling = setInterval(async () => {
+    const data = await api(`/api/logs?since=${lastLogSeq}`);
+    if (!data.ok) return;
+    const logs = data.logs || [];
+    if (logs.length === 0) return;
+    lastLogSeq = data.lastSeq;
+    const area = document.getElementById('logArea');
+    logs.forEach(l => {
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.textContent = l.text;
+      area.appendChild(div);
+    });
+    // Keep max 500 lines
+    while (area.children.length > 500) area.removeChild(area.firstChild);
+    area.scrollTop = area.scrollHeight;
+  }, 2000);
+}
+
+// ---- Status indicator ----
+async function checkConnection() {
+  try {
+    const data = await api('/api/config');
+    const dot = document.getElementById('statusDot');
+    const txt = document.getElementById('statusText');
+    if (data.ok) {
+      dot.className = 'status-dot ok';
+      txt.textContent = '已连接';
+    } else {
+      dot.className = 'status-dot err';
+      txt.textContent = '异常';
+    }
+  } catch {
+    document.getElementById('statusDot').className = 'status-dot err';
+    document.getElementById('statusText').textContent = '连接失败';
+  }
+}
+
+function esc(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ---- Init ----
+refreshAll();
+checkConnection();
+startLogPolling();
+loadApiKeys();
+setInterval(checkConnection, 10000);
+setInterval(loadAccounts, 3000);  // 3秒刷新一次，实时显示注册状态
+setInterval(loadApiKeys, 15000);  // 15秒刷新 API key 列表
+loadGptLoadGroups();  // 进入 API Keys 标签时加载 gpt-load 分组
+</script>
+</body>
+</html>

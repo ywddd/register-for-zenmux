@@ -1,0 +1,37 @@
+# 依赖
+node_modules/
+
+# 环境变量 / 敏感配置（含真实 CapSolver key、refresh_token）
+.env
+
+# 注册产生的会话与结果（含真实 cookie / session）
+zenmux_sessions/
+zenmux_results/
+
+# 自动提取的邀请码（真实账号关联）
+zenmux_invite_codes.json
+
+# 自动创建的 API Key（含真实 sk-ai-v1 / sk-mg-v1 token）
+zenmux_api_keys.json
+
+# 账号配置文件（含真实 refresh_token / password）
+zenmux_accounts.json
+
+# 抓包工具产生的文件（含真实 API 请求/响应/token）
+captured_apis.json
+captured_apis_keys.json
+
+# 调试截图（含页面状态）
+*.png
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode/
+.idea/
+
