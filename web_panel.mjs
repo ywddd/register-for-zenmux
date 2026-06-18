@@ -41,12 +41,52 @@ const CONFIG = {
   GRAPH_FETCH_TIMEOUT: parseInt(process.env.GRAPH_FETCH_TIMEOUT || "60000"),
   // hotmail_helper 单条路最多等多久（默认 60s，与 ZenMux Send 按钮重发冷却一致）
   HOTMAIL_FETCH_TIMEOUT: parseInt(process.env.HOTMAIL_FETCH_TIMEOUT || "60000"),
+  // 并发注册：同时进行中的账号数（默认 3，上限 20）
+  CONCURRENCY: Math.min(20, Math.max(1, parseInt(process.env.CONCURRENCY || "3"))),
   // gpt-load 导入配置（把 ZenMux pay key 自动导入 gpt-load）
   GPTLOAD_BASE: process.env.GPTLOAD_BASE || "http://127.0.0.1:3001",
   GPTLOAD_AUTH_KEY: process.env.GPTLOAD_AUTH_KEY || "",
   // pay key 导入到哪个分组 id（留空则不自动导入）
   GPTLOAD_PAY_GROUP_ID: process.env.GPTLOAD_PAY_GROUP_ID || "",
+  // 动态代理（可选）：rotating 代理 URL，格式 http://user:pass@host:port 或 http://host:port
+  // 每个浏览器上下文走该代理；留空则不走代理
+  PROXY_URL: process.env.PROXY_URL || "",
 };
+
+const ENV_FILE = path.join(__dirname, ".env");
+
+// 解析 PROXY_URL 为 Playwright proxy 对象；返回 null 表示不用代理
+function parseProxy(url) {
+  if (!url) return null;
+  try {
+    const m = url.match(/^(https?):\/\/(?:([^:@/]+):([^@/]+)@)?([^:/]+)(?::(\d+))?(\/.*)?$/i);
+    if (!m) return null;
+    const [, scheme, user, pass, host, port] = m;
+    const proxy = { server: `${scheme}://${host}:${port || 80}` };
+    if (user) { proxy.username = decodeURIComponent(user); proxy.password = decodeURIComponent(pass || ""); }
+    return proxy;
+  } catch (e) { return null; }
+}
+
+// 把配置写回 .env（保留注释/未管理变量，只更新/追加指定键）
+function updateEnvFile(updates) {
+  let lines = [];
+  if (fs.existsSync(ENV_FILE)) lines = fs.readFileSync(ENV_FILE, "utf-8").split(/\r?\n/);
+  const keySet = new Set();
+  const out = lines.map(line => {
+    const m = line.match(/^([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/);
+    if (m && updates.hasOwnProperty(m[1])) {
+      keySet.add(m[1]);
+      return `${m[1]}=${updates[m[1]]}`;
+    }
+    return line;
+  });
+  // 追加未存在的键
+  for (const k of Object.keys(updates)) {
+    if (!keySet.has(k)) out.push(`${k}=${updates[k]}`);
+  }
+  fs.writeFileSync(ENV_FILE, out.join("\n") + "\n");
+}
 
 const RESULTS_DIR = path.join(__dirname, "zenmux_results");
 const SESSIONS_DIR = path.join(__dirname, "zenmux_sessions");
@@ -98,14 +138,16 @@ function loadAccounts() {
 }
 
 function saveAccounts(accounts) {
-  const data = accounts.map((a) => ({
-    email: a.email,
-    password: a.password || "",
-    client_id: a.client_id,
-    refresh_token: a.refresh_token,
-    skip: a.skip === true,
-  }));
-  fs.writeFileSync(CONFIG.MS_ACCOUNTS_FILE, JSON.stringify(data, null, 2));
+  return withFileLock(CONFIG.MS_ACCOUNTS_FILE, () => {
+    const data = accounts.map((a) => ({
+      email: a.email,
+      password: a.password || "",
+      client_id: a.client_id,
+      refresh_token: a.refresh_token,
+      skip: a.skip === true,
+    }));
+    fs.writeFileSync(CONFIG.MS_ACCOUNTS_FILE, JSON.stringify(data, null, 2));
+  });
 }
 
 function loadResults() {
@@ -144,15 +186,17 @@ function getAllInviteCodes() {
 
 // 保存新提取的邀请码
 function saveInviteCode(email, inviteCode) {
-  let data = [];
-  if (fs.existsSync(INVITE_CODES_FILE)) {
-    try { data = JSON.parse(fs.readFileSync(INVITE_CODES_FILE, "utf-8")); } catch (e) {}
-  }
-  const exists = data.find(d => d.email === email || d.inviteCode === inviteCode);
-  if (exists) return;
-  data.push({ email, inviteCode, error: null });
-  fs.writeFileSync(INVITE_CODES_FILE, JSON.stringify(data, null, 2));
-  log(`✓ 邀请码已保存: ${email} → ${inviteCode}`);
+  return withFileLock(INVITE_CODES_FILE, () => {
+    let data = [];
+    if (fs.existsSync(INVITE_CODES_FILE)) {
+      try { data = JSON.parse(fs.readFileSync(INVITE_CODES_FILE, "utf-8")); } catch (e) {}
+    }
+    const exists = data.find(d => d.email === email || d.inviteCode === inviteCode);
+    if (exists) return;
+    data.push({ email, inviteCode, error: null });
+    fs.writeFileSync(INVITE_CODES_FILE, JSON.stringify(data, null, 2));
+    log(`✓ 邀请码已保存: ${email} → ${inviteCode}`);
+  });
 }
 
 // 通过浏览器提取已登录账号的邀请码
@@ -254,14 +298,16 @@ const API_KEYS_FILE = path.join(__dirname, "zenmux_api_keys.json");
 
 // 保存已创建的 API key
 function saveApiKey(email, keyInfo) {
-  let data = [];
-  if (fs.existsSync(API_KEYS_FILE)) {
-    try { data = JSON.parse(fs.readFileSync(API_KEYS_FILE, "utf-8")); } catch (e) {}
-  }
-  // 同邮箱同 key id 去重
-  data = data.filter(d => !(d.email === email && d.id === keyInfo.id));
-  data.push({ email, ...keyInfo, savedAt: new Date().toISOString() });
-  fs.writeFileSync(API_KEYS_FILE, JSON.stringify(data, null, 2));
+  return withFileLock(API_KEYS_FILE, () => {
+    let data = [];
+    if (fs.existsSync(API_KEYS_FILE)) {
+      try { data = JSON.parse(fs.readFileSync(API_KEYS_FILE, "utf-8")); } catch (e) {}
+    }
+    // 同邮箱同 key id 去重
+    data = data.filter(d => !(d.email === email && d.id === keyInfo.id));
+    data.push({ email, ...keyInfo, savedAt: new Date().toISOString() });
+    fs.writeFileSync(API_KEYS_FILE, JSON.stringify(data, null, 2));
+  });
 }
 
 // 读取已保存的 API keys
@@ -467,10 +513,35 @@ function loadSessions() {
 // ============================================================
 // 注册核心逻辑
 // ============================================================
-let registering = false;
+let registering = false;        // 是否有批量注册任务在跑
+let stopRequested = false;       // 是否请求停止
 let currentTaskId = null;
 const registeringAccounts = new Set(); // 正在注册中的账号邮箱
 const taskLogs = new Map(); // taskId -> string[]
+
+// ---- 文件写入互斥锁（并发时防止 JSON 读-改-写竞争损坏文件）----
+const fileLocks = new Map(); // filePath -> Promise chain
+function withFileLock(filePath, fn) {
+  const prev = fileLocks.get(filePath) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  fileLocks.set(filePath, next.catch(() => {}));
+  return next;
+}
+
+// ---- 并发信号量（限制同时进行的注册数）----
+class Semaphore {
+  constructor(max) { this.max = max; this.active = 0; this.queue = []; }
+  async acquire() {
+    if (this.active < this.max) { this.active++; return; }
+    await new Promise(resolve => this.queue.push(resolve));
+    this.active++;
+  }
+  release() {
+    this.active--;
+    if (this.queue.length) this.queue.shift()();
+  }
+}
+const regSemaphore = new Semaphore(CONFIG.CONCURRENCY);
 
 function taskLog(taskId, msg) {
   log(msg);
@@ -593,16 +664,16 @@ async function fetchVerificationCodeFromGraph(email, refresh_token, client_id, t
   return null;
 }
 
-async function fetchVerificationCode(email, refresh_token, client_id, taskId, codeSendTime = 0) {
+async function fetchVerificationCode(email, refresh_token, client_id, taskId, codeSendTime = 0, waitMs = 0) {
   const startTime = Date.now();
-  taskLog(taskId, `开始监听邮箱 ${email} 的验证码 (hotmail_helper)...`);
+  // 单轮等待时长：默认 HOTMAIL_FETCH_TIMEOUT；上层可按轮次传入（第1轮65s、第2轮15s）
+  const timeout = waitMs > 0 ? waitMs : CONFIG.HOTMAIL_FETCH_TIMEOUT;
+  taskLog(taskId, `开始监听邮箱 ${email} 的验证码 (hotmail_helper，本轮等 ${Math.round(timeout / 1000)}s)...`);
 
   // 只接受发送验证码之后到达的邮件（容错 30s 前置窗口）
   const monitorStartTime = codeSendTime ? (codeSendTime - 30_000) : (Date.now() - 60_000);
 
-  // hotmail_helper 单条路最多跑 HOTMAIL_FETCH_TIMEOUT（默认 60s，与 ZenMux 重发冷却一致）；
-  // 跑满 60s 还没收到，说明该轮没来，此时重发按钮刚好解禁，上层立即重发
-  const helperDeadline = startTime + CONFIG.HOTMAIL_FETCH_TIMEOUT;
+  const helperDeadline = startTime + timeout;
 
   while (Date.now() < helperDeadline) {
     // 检查收件箱 + 垃圾邮件
@@ -821,17 +892,32 @@ async function registerAccount(account, taskId) {
   // 标记账号为注册中
   registeringAccounts.add(email.toLowerCase());
 
-  taskLog(taskId, `开始注册: ${email}`);
   const result = { success: false, email, sessionId: null, error: null };
   let browser = null, context = null;
+  const startedAt = Date.now();
 
   try {
-    browser = await chromium.launch({ headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO });
-    context = await browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 800 },
-      locale: "en-US",
-    });
+    taskLog(taskId, `开始注册: ${email}`);
+    const proxy = parseProxy(CONFIG.PROXY_URL);
+    if (proxy) taskLog(taskId, `使用代理: ${proxy.server}${proxy.username ? " (带鉴权)" : ""}`);
+    const launchOpts = { headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO };
+    if (proxy) launchOpts.proxy = proxy;
+    browser = await chromium.launch(launchOpts);
+    // 启动后简单验证代理是否生效：若 newContext 失败多半是代理连不上
+    try {
+      context = await browser.newContext({
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport: { width: 1280, height: 800 },
+        locale: "en-US",
+      });
+    } catch (e) {
+      if (proxy) {
+        taskLog(taskId, `⚠ 代理连接失败: ${e.message}，跳过该账号`);
+        result.error = `代理连接失败: ${e.message}`;
+        return result;
+      }
+      throw e;
+    }
     const page = await context.newPage();
 
     // ---- 早期 patch turnstile.render，拦截 callback ----
@@ -1120,11 +1206,18 @@ async function registerAccount(account, taskId) {
       }
     }
 
-    // ---- 7+8. 点击发送验证码并获取（收不到时 60s 后重发，最多 3 轮）----
-    const MAX_SEND_ROUNDS = 3;
+    // ---- 7+8. 点击发送验证码并获取（第1轮等65s，第2轮等15s，都没收到就跳过）----
+    // 第1轮：65s（覆盖邮件投递延迟 + ZenMux Send 重发冷却60s）
+    // 第2轮：15s（重发冷却刚结束，邮件通常已到，短等即可）
+    // 都没收到 → 直接跳过该账号
+    const SEND_ROUNDS = [
+      { wait: 65_000, label: "第1轮（等65s）" },
+      { wait: 15_000, label: "第2轮（等15s）" },
+    ];
     let code = null;
-    for (let round = 1; round <= MAX_SEND_ROUNDS && !code; round++) {
-      taskLog(taskId, round === 1 ? "点击发送验证码..." : `第 ${round} 轮：未收到验证码，重新点击发送...`);
+    for (let round = 0; round < SEND_ROUNDS.length && !code; round++) {
+      const { wait, label } = SEND_ROUNDS[round];
+      taskLog(taskId, round === 0 ? `点击发送验证码... (${label})` : `未收到验证码，重新点击发送... (${label})`);
 
       // 找 Send 按钮
       let sendBtn = null;
@@ -1153,18 +1246,14 @@ async function registerAccount(account, taskId) {
       await sleep(1000);
       // 记录发送验证码的时刻，只接受这之后到达的邮件（避免读到旧验证码）
       const codeSendTime = Date.now();
-      // 直接用 hotmail_helper 取码（它底层走 Graph，实测比直连 Graph 更稳更快）
-      code = await fetchVerificationCode(email, refresh_token, client_id, taskId, codeSendTime);
+      // 直接用 hotmail_helper 取码，本轮等待 wait 毫秒
+      code = await fetchVerificationCode(email, refresh_token, client_id, taskId, codeSendTime, wait);
       if (code) {
         taskLog(taskId, `验证码: ${code}`);
         break;
       }
-      // 还没收到：60s 已到，Send 按钮重发冷却结束，立即重发（第 3 轮直接失败）
-      if (round < MAX_SEND_ROUNDS) {
-        taskLog(taskId, `第 ${round} 轮未收到验证码（已满 60s），立即重新发送...`);
-      }
     }
-    if (!code) { result.error = "获取验证码超时（已重发 " + MAX_SEND_ROUNDS + " 次）"; return result; }
+    if (!code) { result.error = "获取验证码超时（两轮均未收到）"; return result; }
 
     // ---- 9. 输入验证码 ----
     await sleep(2000);
@@ -1397,6 +1486,7 @@ async function registerAccount(account, taskId) {
     // 移除注册中状态
     registeringAccounts.delete(email.toLowerCase());
     if (browser) await browser.close();
+    taskLog(taskId, `结束注册: ${email} | 耗时 ${Math.round((Date.now() - startedAt) / 1000)}s | ${result.success ? "成功" : "失败"}`);
   }
   return result;
 }
@@ -1578,6 +1668,9 @@ async function handleRequest(req, res) {
           capsolverKey: CONFIG.CAPSOLVER_API_KEY ? CONFIG.CAPSOLVER_API_KEY.slice(0, 12) + "..." : "",
           headless: CONFIG.HEADLESS,
           hotmailApi: CONFIG.HOTMAIL_API_BASE,
+          concurrency: CONFIG.CONCURRENCY,
+          maxConcurrency: 20,
+          proxyUrl: CONFIG.PROXY_URL || "",
         },
       });
     }
@@ -1587,6 +1680,30 @@ async function handleRequest(req, res) {
       const body = await parseBody(req);
       if (body.inviteCodes !== undefined) CONFIG.INVITE_CODES = body.inviteCodes;
       if (body.headless !== undefined) CONFIG.HEADLESS = body.headless;
+      // 动态调整并发数（仅在无注册任务时生效，避免中途改信号量）
+      if (body.concurrency !== undefined) {
+        if (registering) {
+          return json(res, { ok: false, error: "注册进行中，无法调整并发数" }, 400);
+        }
+        const n = parseInt(body.concurrency, 10);
+        if (isNaN(n) || n < 1 || n > 20) {
+          return json(res, { ok: false, error: "并发数需在 1-20 之间" }, 400);
+        }
+        CONFIG.CONCURRENCY = n;
+        regSemaphore.max = n;
+        updateEnvFile({ CONCURRENCY: String(n) });
+        return json(res, { ok: true, concurrency: CONFIG.CONCURRENCY });
+      }
+      // 动态代理 URL（即时生效 + 写回 .env）
+      if (body.proxyUrl !== undefined) {
+        const url = String(body.proxyUrl || "").trim();
+        if (url && !parseProxy(url)) {
+          return json(res, { ok: false, error: "代理 URL 格式错误，应为 http://user:pass@host:port" }, 400);
+        }
+        CONFIG.PROXY_URL = url;
+        updateEnvFile({ PROXY_URL: url });
+        return json(res, { ok: true, proxyUrl: CONFIG.PROXY_URL });
+      }
       return json(res, { ok: true });
     }
 
@@ -1634,6 +1751,7 @@ async function handleRequest(req, res) {
       }
 
       registering = true;
+      stopRequested = false;
       const taskId = `task_${Date.now()}`;
       currentTaskId = taskId;
       taskLogs.set(taskId, []);
@@ -1644,34 +1762,49 @@ async function handleRequest(req, res) {
             const result = await registerAccount(account, taskId);
             taskLog(taskId, `任务完成: ${result.success ? "成功" : "失败"}`);
           } else {
-            const results = [];
+            // 批量注册：按 CONCURRENCY 并发派发
             const sessions = loadSessions();
-            for (const acc of accounts) {
-              // 跳过已注册的账号
-              if (sessions.find((s) => s.email.toLowerCase() === acc.email.toLowerCase())) {
-                taskLog(taskId, `跳过已注册: ${acc.email}`);
-                continue;
+            // 预先过滤出待注册账号（跳过已注册/注册中/skip）
+            const pending = accounts.filter(acc =>
+              !sessions.find(s => s.email.toLowerCase() === acc.email.toLowerCase()) &&
+              !registeringAccounts.has(acc.email.toLowerCase()) &&
+              acc.skip !== true
+            );
+            taskLog(taskId, `批量注册: 共 ${pending.length} 个待注册，并发 ${CONFIG.CONCURRENCY}`);
+
+            const results = [];
+            let idx = 0;
+            // 派发 worker：每个 worker 抢信号量槽 → 取一个账号 → 注册 → 还槽 → 继续
+            async function worker(workerId) {
+              while (true) {
+                if (stopRequested) return;
+                const i = idx++;
+                if (i >= pending.length) return;
+                const acc = pending[i];
+                await regSemaphore.acquire();
+                try {
+                  if (stopRequested) { taskLog(taskId, `⏹ 已请求停止，跳过 ${acc.email}`); return; }
+                  const result = await registerAccount(acc, taskId);
+                  results.push(result);
+                } catch (e) {
+                  results.push({ success: false, email: acc.email, error: e.message });
+                } finally {
+                  regSemaphore.release();
+                }
               }
-              // 跳过正在注册中的账号
-              if (registeringAccounts.has(acc.email.toLowerCase())) {
-                taskLog(taskId, `跳过注册中: ${acc.email}`);
-                continue;
-              }
-              // 跳过标记为 skip 的账号
-              if (acc.skip === true) {
-                taskLog(taskId, `跳过(已禁用): ${acc.email}`);
-                continue;
-              }
-              const result = await registerAccount(acc, taskId);
-              results.push(result);
-              await sleep(3000);
             }
+            // 启动 CONCURRENCY 个 worker，等全部结束
+            const workers = [];
+            for (let w = 0; w < CONFIG.CONCURRENCY; w++) workers.push(worker(w));
+            await Promise.all(workers);
+
             taskLog(taskId, `批量注册完成: ${results.filter(r => r.success).length} 成功, ${results.filter(r => !r.success).length} 失败`);
           }
         } catch (e) {
           taskLog(taskId, `任务出错: ${e.message}`);
         } finally {
           registering = false;
+          stopRequested = false;
           currentTaskId = null;
         }
       })();
@@ -1681,6 +1814,7 @@ async function handleRequest(req, res) {
 
     // 停止注册
     if (pathname === "/api/register/stop" && req.method === "POST") {
+      stopRequested = true;
       registering = false;
       return json(res, { ok: true });
     }
@@ -1716,7 +1850,10 @@ async function handleRequest(req, res) {
       (async () => {
         let browser = null;
         try {
-          browser = await chromium.launch({ headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO });
+          const proxy = parseProxy(CONFIG.PROXY_URL);
+          const launchOpts = { headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO };
+          if (proxy) launchOpts.proxy = proxy;
+          browser = await chromium.launch(launchOpts);
           const statePath = path.join(SESSIONS_DIR, `${account.email.replace(/[@.]/g, "_")}.json`);
           const context = await browser.newContext({ storageState: statePath });
           const page = await context.newPage();
@@ -1814,7 +1951,10 @@ async function handleRequest(req, res) {
               return savedKey || null;
             }
             // 有 session：复用登录态直接查/建
-            browser = await chromium.launch({ headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO });
+            const proxy = parseProxy(CONFIG.PROXY_URL);
+            const launchOpts = { headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO };
+            if (proxy) launchOpts.proxy = proxy;
+            browser = await chromium.launch(launchOpts);
             const statePath = path.join(SESSIONS_DIR, `${account.email.replace(/[@.]/g, "_")}.json`);
             const context = await browser.newContext({ storageState: statePath });
             const page = await context.newPage();

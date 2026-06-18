@@ -174,6 +174,22 @@
             <option value="">-- 全部未注册 --</option>
           </select>
         </div>
+        <div class="field" style="display:flex;gap:12px;align-items:center">
+          <div style="flex:1">
+            <label>并发数 (1-20)</label>
+            <input id="regConcurrency" type="number" min="1" max="20" value="3" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;width:100%">
+          </div>
+          <button class="btn btn-sm" style="background:var(--border);align-self:flex-end" onclick="saveConcurrency()">保存</button>
+        </div>
+        <p style="font-size:12px;color:var(--text2);margin-top:-4px">同时注册几个账号。每个账号开一个浏览器，注意内存（2核4G 建议 2-3）。</p>
+        <div class="field" style="display:flex;gap:12px;align-items:center">
+          <div style="flex:1">
+            <label>动态代理 (留空=不走代理)</label>
+            <input id="regProxyUrl" placeholder="http://user:pass@host:port" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:12px;width:100%">
+          </div>
+          <button class="btn btn-sm" style="background:var(--border);align-self:flex-end" onclick="saveProxy()">保存</button>
+        </div>
+        <p style="font-size:12px;color:var(--text2);margin-top:-4px">rotating 代理，每个浏览器走该代理；保存后写入 .env 即时生效。代理连不上会跳过该账号。</p>
         <button class="btn btn-primary" id="btnRegister" onclick="startRegister()">开始注册</button>
         <button class="btn btn-danger" id="btnStop" onclick="stopRegister()" style="margin-left:8px;display:none">停止</button>
       </div>
@@ -447,6 +463,15 @@ async function loadConfig() {
   document.getElementById('cfgInviteCodes').value = (cfg.inviteCodes || []).join(',');
   document.getElementById('cfgHeadless').textContent = cfg.headless ? '无头模式' : '有头模式';
   document.getElementById('cfgCsKey').textContent = cfg.capsolverKey || '未配置';
+  // 并发数（注册标签的输入框）
+  const concEl = document.getElementById('regConcurrency');
+  if (concEl) {
+    concEl.value = cfg.concurrency ?? 3;
+    concEl.max = cfg.maxConcurrency ?? 20;
+  }
+  // 代理 URL
+  const proxyEl = document.getElementById('regProxyUrl');
+  if (proxyEl) proxyEl.value = cfg.proxyUrl || '';
 
   // 自动提取的邀请码
   const autoCodes = cfg.autoInviteCodes || [];
@@ -723,6 +748,33 @@ async function saveConfig() {
   const data = await api('/api/config', { method: 'POST', body: JSON.stringify({ inviteCodes }) });
   if (data.ok) alert('配置已保存');
   loadConfig();
+}
+
+// 保存并发数（注册标签里的输入框）
+async function saveConcurrency() {
+  const n = parseInt(document.getElementById('regConcurrency').value, 10);
+  if (isNaN(n) || n < 1 || n > 20) return alert('并发数需在 1-20 之间');
+  const data = await api('/api/config', { method: 'POST', body: JSON.stringify({ concurrency: n }) });
+  if (data.ok) {
+    alert(`并发数已设为 ${n}`);
+    loadConfig();
+  } else {
+    alert(data.error || '保存失败');
+    loadConfig();
+  }
+}
+
+// 保存代理 URL（即时生效 + 写入 .env）
+async function saveProxy() {
+  const url = document.getElementById('regProxyUrl').value.trim();
+  const data = await api('/api/config', { method: 'POST', body: JSON.stringify({ proxyUrl: url }) });
+  if (data.ok) {
+    alert(url ? '代理已保存并即时生效' : '已清除代理（走本机IP）');
+    loadConfig();
+  } else {
+    alert(data.error || '保存失败');
+    loadConfig();
+  }
 }
 
 async function startRegister() {

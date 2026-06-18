@@ -10,6 +10,8 @@
 - 🔗 **邀请码轮换** - 支持多个邀请码随机选择，注册成功后自动提取新账号邀请码加入轮换
 - 🔑 **API Key 自动创建** - 注册成功后自动创建 Pay API（sk-ai-v1）和 Platform API（sk-mg-v1），带 CSRF 处理
 - 🚚 **gpt-load 联动** - Pay Key 可一键/自动导入 gpt-load 指定分组
+- ⚡ **并发注册** - 信号量控制并发（默认 3，上限 20），文件写入加锁防损坏；面板可实时调整
+- 🌐 **动态代理** - 支持 rotating 代理（每账号独立出口 IP），降低同 IP 风控；面板填写即时保存
 - 🌐 **Web 管理面板** - 零依赖原生 HTTP，深色主题全功能 UI
 - 📦 **批量操作** - 批量导入账号（支持 `----` 分隔文本 / JSON / 文件上传）、批量注册、账号可移出/恢复待注册
 - 🖥️ **跨平台** - 支持 Windows / Linux / macOS
@@ -111,14 +113,37 @@ node web_panel.mjs
 13. Pay key 自动导入 gpt-load（若配置 GPTLOAD_PAY_GROUP_ID）
 ```
 
-**验证码收不到时**：单轮取码 60 秒（与 ZenMux Send 重发冷却对齐），未收到立即重发，最多 3 轮。
+**验证码收不到时**：第 1 轮等 65 秒，未收到重发；第 2 轮等 15 秒，仍未收到则跳过该账号。
+
+## 并发注册
+
+批量注册时支持并发，多个账号同时进行（等邮件的空闲时间被利用）：
+
+- `CONCURRENCY=3`（默认，上限 20），每个账号开一个独立浏览器
+- 文件写入（账号/邀请码/key）加互斥锁，防并发损坏 JSON
+- 面板「触发注册」可实时调整并发数（注册中不可改）
+- 注意内存：2 核 4G 机器建议 2–3，资源充足可调高
+
+## 动态代理
+
+支持 rotating 代理，每个浏览器走独立出口 IP，降低同 IP 多账号风控：
+
+```env
+PROXY_URL=http://user:pass@host:port
+```
+
+- 格式 `http://user:pass@host:port` 或 `http://host:port`（IP 白名单方式）
+- rotating 代理每次连接换 IP，并发账号自动分配不同 IP
+- 代理连不上自动跳过该账号
+- 面板「触发注册」可填写即时保存（写入 `.env` 即时生效）
+- CapSolver 打码走服务端，不受代理影响
 
 ## Web 管理面板
 
 | 模块 | 功能 |
 |------|------|
 | 📋 账号管理 | 查看/添加/删除账号，批量导入（文本+文件），移出/恢复待注册，实时状态（未注册/注册中/已注册/已跳过） |
-| 🚀 注册 | 单个/批量注册，实时日志，停止任务 |
+| 🚀 注册 | 单个/批量注册，并发数控制，动态代理配置，实时日志，停止任务 |
 | 🔑 API Keys | 查看/创建 Pay·Platform key，导出 txt，一键导入 gpt-load |
 | 📜 日志 | 系统运行日志 |
 | ⚙️ 设置 | 邀请码配置（手动+自动提取），服务状态，CapSolver 余额 |
@@ -132,8 +157,10 @@ node web_panel.mjs
 | PATCH | `/api/accounts/:email` | 切换 skip（移出/恢复待注册） |
 | DELETE | `/api/accounts/:email` | 删除账号 |
 | POST | `/api/accounts/import` | 批量导入 |
-| POST | `/api/register` | 触发注册 |
+| POST | `/api/register` | 触发注册（支持并发） |
 | GET | `/api/register/status` | 注册状态 + 日志 |
+| POST | `/api/register/stop` | 停止注册 |
+| POST | `/api/config` | 更新配置（邀请码/并发数/代理URL，写回 .env） |
 | GET | `/api/invite-codes` | 邀请码列表 |
 | POST | `/api/invite-codes/extract` | 手动提取邀请码 |
 | GET | `/api/api-keys` | 已保存的 API Key |
@@ -187,6 +214,20 @@ python3 "hotmail_helper(1).py"
 bash start_hotmail_helper.sh
 ```
 
+取码策略：直接走 hotmail_helper（Graph 底层），仅认本次发送后的新邮件（旧码时间过滤）。第 1 轮等 65s，未收到重发；第 2 轮等 15s，仍未收到则跳过该账号。
+
+### 并发与代理（可选）
+
+```env
+# 并发数（默认 3，上限 20）
+CONCURRENCY=3
+
+# 动态代理（rotating，每账号独立出口 IP）
+PROXY_URL=http://user:pass@host:port
+```
+
+两者都可在面板「触发注册」实时调整并写回 `.env`。详见上方「并发注册」「动态代理」章节。
+
 ### Microsoft OAuth
 
 需 Azure AD 注册应用获取 `client_id`，并授权邮箱读取权限（Mail.ReadWrite）。
@@ -230,13 +271,19 @@ server {
 确认 `CAPSOLVER_API_KEY` 正确、余额充足。代码会自动重试 3 次。
 
 **Q: 获取验证码超时？**
-检查 `refresh_token` 是否有效、hotmail_helper 是否运行（面板会自动起）、垃圾邮件文件夹。未收到会自动重发最多 3 轮。
+检查 `refresh_token` 是否有效、hotmail_helper 是否运行（面板会自动起）、垃圾邮件文件夹。第 1 轮等 65s、第 2 轮等 15s，仍未收到则跳过该账号。
 
 **Q: 创建 API Key 报 401？**
 该账号 session 失效。代码会自动删除死 session 并重新登录后再建 key。
 
 **Q: 已注册账号重复打码？**
 不会。有 session 的账号自动跳过。
+
+**Q: 并发注册会损坏数据吗？**
+不会。账号/邀请码/API Key 的文件写入都有互斥锁，并发安全。
+
+**Q: 代理连不上怎么办？**
+代理连接失败会自动跳过该账号，不影响其它账号注册。检查 `PROXY_URL` 格式与代理可用性。
 
 **Q: Linux 无头模式报错？**
 `npx playwright install-deps chromium`
