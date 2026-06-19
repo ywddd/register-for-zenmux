@@ -93,6 +93,56 @@ node web_panel.mjs
 
 面板会**自动拉起 hotmail_helper 接码子进程**，无需单独启动。访问 `http://你的IP:17380`。
 
+> ⚠ 这样直接跑会**挂在当前终端**——关掉 SSH / 终端，面板会收到 `SIGHUP` 被内核杀掉（这不是 bug，是 Linux 会话机制：进程挂在终端的控制终端上，终端没了就给整组发 SIGHUP）。要长期跑请用下面的「systemd 常驻后台」。
+
+### 6. 常驻后台（systemd，推荐）
+
+直接 `node web_panel.mjs` 跑在终端里，关终端就停。用 systemd user 服务可开机自启、关 SSH 不停、崩溃自动重启：
+
+```bash
+# 1) 建服务文件（注意把 node 路径换成你机器上的，which node 查看）
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/zenmux-panel.service <<'EOF'
+[Unit]
+Description=ZenMux 注册管理面板（含 hotmail_helper 接码）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/ubuntu/register
+ExecStart=/home/ubuntu/.nvm/versions/node/v24.16.0/bin/node /home/ubuntu/register/web_panel.mjs
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/ubuntu/register/panel.log
+StandardError=append:/home/ubuntu/register/panel.log
+Environment=NODE_ENV=production
+Environment=PLAYWRIGHT_BROWSERS_PATH=%h/.cache/ms-playwright
+
+[Install]
+WantedBy=default.target
+EOF
+
+# 2) 开启 linger：让服务在你没登录 SSH 时也运行（关键，否则关 SSH 仍会停）
+sudo loginctl enable-linger $USER
+
+# 3) 加载 + 开机自启 + 立即启动
+systemctl --user daemon-reload
+systemctl --user enable --now zenmux-panel.service
+```
+
+常用管理命令（不用再开终端守着）：
+
+```bash
+systemctl --user status zenmux-panel      # 看状态
+systemctl --user restart zenmux-panel     # 重启（改了 .env 后用它重载）
+systemctl --user stop zenmux-panel        # 停止
+systemctl --user start zenmux-panel       # 启动
+journalctl --user -u zenmux-panel -f      # 实时日志（Ctrl+C 退出查看，不影响服务）
+tail -f /home/ubuntu/register/panel.log   # 或看日志文件
+```
+
+> 代码层面已加兜底：全局 `uncaughtException`/`unhandledRejection` 接住不崩；hotmail_helper 子进程崩了 5s 自动重启；面板退出时连带清理子进程。所以即便个别注册任务抛异常，也不会拖垮整个面板和其它正在跑的号。
+
 ## 注册流程
 
 每个账号全自动：
@@ -248,7 +298,7 @@ npx playwright install chromium
 npx playwright install-deps chromium
 pip install flask requests
 
-# PM2 守护
+# 常驻后台（推荐 systemd，见上方「常驻后台」小节；PM2 亦可）
 npm install -g pm2
 pm2 start web_panel.mjs --name zenmux-panel
 pm2 save && pm2 startup
