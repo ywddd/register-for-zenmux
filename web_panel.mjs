@@ -2005,6 +2005,11 @@ async function handleRequest(req, res) {
 const server = http.createServer(handleRequest);
 
 // ---- 一并启动 hotmail_helper（接码服务），随面板一起跑 ----
+// hotmail_helper 是关键子进程：它挂了所有取码都会失败。这里做两件事：
+// 1) 监听它的 exit，崩了自动重启（最多每 5s 一次）
+// 2) 面板收到 SIGINT/SIGTERM 时连带把它一起 kill，避免残留孤儿进程
+let helperChild = null;
+let helperStopping = false;
 function startHotmailHelper() {
   const helperScript = path.join(__dirname, "hotmail_helper(1).py");
   if (!fs.existsSync(helperScript)) {
@@ -2019,16 +2024,43 @@ function startHotmailHelper() {
     HOTMAIL_HELPER_PORT: String(helperPort),
     HOTMAIL_HELPER_PASSWORD: CONFIG.HOTMAIL_API_PASSWORD || "",
   };
-  const child = spawn("python3", [helperScript], {
+  helperChild = spawn("python3", [helperScript], {
     cwd: __dirname,
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  child.stdout.on("data", (d) => process.stdout.write(`  [hotmail_helper] ${d}`));
-  child.stderr.on("data", (d) => process.stderr.write(`  [hotmail_helper] ${d}`));
-  child.on("exit", (code) => console.log(`  [hotmail_helper] 进程退出 (code=${code})`));
-  console.log(`  [hotmail_helper] 已启动 (PID=${child.pid}) http://${helperHost}:${helperPort}`);
+  helperChild.stdout.on("data", (d) => process.stdout.write(`  [hotmail_helper] ${d}`));
+  helperChild.stderr.on("data", (d) => process.stderr.write(`  [hotmail_helper] ${d}`));
+  helperChild.on("exit", (code) => {
+    console.log(`  [hotmail_helper] 进程退出 (code=${code})`);
+    helperChild = null;
+    // 非主动停止时自动重启（5s 冷却，避免崩溃循环刷屏）
+    if (!helperStopping) {
+      console.log(`  [hotmail_helper] 5s 后自动重启...`);
+      setTimeout(() => { if (!helperStopping) startHotmailHelper(); }, 5000);
+    }
+  });
+  console.log(`  [hotmail_helper] 已启动 (PID=${helperChild.pid}) http://${helperHost}:${helperPort}`);
 }
+
+// ---- 全局兜底：任何未捕获异常都不让面板整个崩掉 ----
+// （systemd 会重启，但自己接住能保住正在跑的其它注册任务 + 子进程）
+process.on("uncaughtException", (err) => {
+  console.error(`  [致命] uncaughtException: ${err?.stack || err}`);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(`  [致命] unhandledRejection: ${reason?.stack || reason}`);
+});
+
+// 优雅退出：收到信号时 kill 掉 hotmail_helper 子进程再退出
+function shutdown(sig) {
+  console.log(`\n  收到 ${sig}，正在关闭（连带 hotmail_helper）...`);
+  helperStopping = true;
+  if (helperChild) { try { helperChild.kill("SIGTERM"); } catch (e) {} }
+  setTimeout(() => process.exit(0), 300);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.listen(CONFIG.PORT, CONFIG.HOST, () => {
   console.log(`\n  ZenMux 管理面板已启动: http://${CONFIG.HOST}:${CONFIG.PORT}\n`);
