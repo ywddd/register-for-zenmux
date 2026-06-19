@@ -20,6 +20,11 @@ zenmux_accounts.json
 # 抓包工具产生的文件（含真实 API 请求/响应/token）
 captured_apis.json
 captured_apis_keys.json
+captured_flow.json
+
+# 本地测试 / 抓包脚本（开发用，不提交）
+capture_flow.mjs
+register_api_test.mjs
 
 # 调试截图（含页面状态）
 *.png

@@ -12,8 +12,12 @@ import path from "path";
 import os from "os";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
-import { chromium } from "playwright";
+import { ProxyAgent } from "undici";
 import { solveTurnstile, solveRecaptchaV2, solveRecaptchaV3, solveHCaptcha, getBalance } from "./capsolver_helper.mjs";
+
+// ZenMux 验证码 sitekey（抓包实测）
+const TURNSTILE_SITEKEY = "0x4AAAAAAB3vWB8HhhtIcASj";
+const RECAPTCHA_SITEKEY = "6LdN_REsAAAAAKSlH2k4VNXoCT-Fi1bv_Ufaf86t";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -31,8 +35,6 @@ const CONFIG = {
   ACCOUNTS_DIR: process.env.ACCOUNTS_DIR || path.join(HOME, ".cli-proxy-api"),
   INVITE_CODES: (process.env.ZENMUX_INVITE_CODE || "").split(",").map(s => s.trim()).filter(Boolean),
   CAPSOLVER_API_KEY: process.env.CAPSOLVER_API_KEY || "",
-  HEADLESS: process.env.HEADLESS !== "false",
-  SLOW_MO: parseInt(process.env.SLOW_MO || "100"),
   TURNSTILE_TIMEOUT: 120_000,
   CODE_SEND_TIMEOUT: 30_000,
   CODE_FETCH_TIMEOUT: 150_000,
@@ -213,16 +215,27 @@ async function zenmuxApiRequest(email, method, reqPath, body) {
   const headers = { "Accept": "application/json", "Cookie": cookieHeader };
   if (ctoken) headers["X-CSRF-Token"] = ctoken.value;
   if (body) headers["Content-Type"] = "application/json";
-  try {
-    const resp = await fetch(`https://zenmux.ai${reqPath}`, {
-      method, headers, body: body ? JSON.stringify(body) : undefined,
-    });
-    const text = await resp.text();
-    let data = null; try { data = JSON.parse(text); } catch (e) { data = text; }
-    return { ok: resp.ok, status: resp.status, data };
-  } catch (e) {
-    return { ok: false, status: 0, error: e.message };
+  // 重试：网络错误 + 500/502/503 服务端瞬时错误，最多3次
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const resp = await fetch(`https://zenmux.ai${reqPath}`, {
+        method, headers, body: body ? JSON.stringify(body) : undefined,
+      });
+      const text = await resp.text();
+      let data = null; try { data = JSON.parse(text); } catch (e) { data = text; }
+      if ([500, 502, 503].includes(resp.status) && attempt < 3) {
+        lastErr = { ok: false, status: resp.status, data };
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+        continue;
+      }
+      return { ok: resp.ok, status: resp.status, data };
+    } catch (e) {
+      lastErr = { ok: false, status: 0, error: e.message };
+      if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
+    }
   }
+  return lastErr || { ok: false, status: 0, error: "未知错误" };
 }
 
 // 直调 API 提取已登录账号的邀请码（无需浏览器）
@@ -454,19 +467,6 @@ let stopRequested = false;       // 是否请求停止
 let currentTaskId = null;
 const registeringAccounts = new Set(); // 正在注册中的账号邮箱
 const taskLogs = new Map(); // taskId -> string[]
-const activeBrowsers = new Set(); // 当前在跑的 browser 实例，停止时用来主动全关释放 CPU
-
-// 停止：主动关闭所有在跑的浏览器，立刻释放 CPU/内存
-// （否则正在跑的号会继续打码/等邮件/轮询到自然结束，CPU 一直占着）
-function closeAllActiveBrowsers() {
-  if (activeBrowsers.size === 0) return;
-  const toClose = [...activeBrowsers];
-  activeBrowsers.clear();
-  console.log(`  [停止] 立即关闭 ${toClose.length} 个在跑浏览器，释放资源`);
-  // 不 await：让关闭在后台进行，正在 await 页面操作的账号会立刻收到
-  // "Target page/context/browser has been closed" 异常而退出
-  Promise.all(toClose.map((b) => b.close().catch(() => {}))).catch(() => {});
-}
 
 // ---- 文件写入互斥锁（并发时防止 JSON 读-改-写竞争损坏文件）----
 const fileLocks = new Map(); // filePath -> Promise chain
@@ -527,9 +527,10 @@ async function fetchVerificationCodeFromGraph(email, refresh_token, client_id, t
   }
 
   // 只接受"发送验证码之后"到达的邮件（避免读到旧验证码）。
-  // 容错：邮件 receivedDateTime 可能略早于本地点击时刻（投递延迟/时钟偏差），给 30s 前置窗口。
+  // 容错：邮件 receivedDateTime 可能略早于本地点击时刻（投递延迟/时钟偏差），给 5s 前置窗口。
+  // （原 30s 太松，高并发下会漏进上次失败的旧码 → verify 报 Invalid or expired）
   const monitorStartTime = codeSendTime
-    ? new Date(codeSendTime - 30_000)
+    ? new Date(codeSendTime - 5_000)
     : new Date(Date.now() - 60_000);
 
   // Graph 单条路最多跑 GRAPH_FETCH_TIMEOUT，超时就返回 null 让上层换 hotmail_helper
@@ -619,8 +620,8 @@ async function fetchVerificationCode(email, refresh_token, client_id, taskId, co
   const timeout = waitMs > 0 ? waitMs : CONFIG.HOTMAIL_FETCH_TIMEOUT;
   taskLog(taskId, `开始监听邮箱 ${email} 的验证码 (hotmail_helper，本轮等 ${Math.round(timeout / 1000)}s)...`);
 
-  // 只接受发送验证码之后到达的邮件（容错 30s 前置窗口）
-  const monitorStartTime = codeSendTime ? (codeSendTime - 30_000) : (Date.now() - 60_000);
+  // 只接受发送验证码之后到达的邮件（容错 5s 前置窗口，避免旧码）
+  const monitorStartTime = codeSendTime ? (codeSendTime - 5_000) : (Date.now() - 60_000);
 
   const helperDeadline = startTime + timeout;
 
@@ -803,669 +804,173 @@ async function solveSecondaryCaptcha(page, taskId, probe, sitekey) {
   return false;
 }
 
-// 流量节省：拦截图片/字体/追踪脚本（注册用不到 banner 图、产品图、gtag 追踪）
-// 单次页面加载从 ~8MB 降到 ~2.5MB，砍约 70%。Turnstile/reCAPTCHA 是脚本不受影响。
-const BLOCK_RES_TYPES = new Set(["image", "media", "font"]);
-const BLOCK_URL_RE = /googletagmanager|google-analytics|gtag\/js|doubleclick|googlesyndication|facebook\.com\/tr|connect\.facebook|hotjar|sentry\.io|umeng|hm\.baidu|clarity\.ms|plausible|segment\.io|amplitude/;
-function applyTrafficSaver(context) {
-  context.route("**/*", (route) => {
-    const req = route.request();
-    try {
-      if (BLOCK_RES_TYPES.has(req.resourceType())) return route.abort();
-      if (BLOCK_URL_RE.test(req.url())) return route.abort();
-    } catch (e) {}
-    return route.continue();
-  });
-}
 
-async function registerAccount(account, taskId) {
+// ============================================================
+// 纯 API 注册（不开浏览器，省流量）：抓包实测的接口直调
+// 流程：取ctoken → get_invite_user → CapSolver Turnstile → send → 取码 →
+//       verify → (referral/info 非200则) CapSolver reCAPTCHA → recaptcha/verification →
+//       referral/info 200 → 保存session → 提取邀请码/建key（复用直调）
+// 代理可选：配了 PROXY_URL 就走代理（undici ProxyAgent），否则直连
+// ============================================================
+async function registerAccountApi(account, taskId) {
   const { email, refresh_token, client_id } = account;
-
-  // 标记为跳过的账号直接跳过
-  if (account.skip === true) {
-    taskLog(taskId, `⚠ ${email} 已标记跳过，不注册`);
-    return { success: false, email, sessionId: null, error: "已跳过", skipped: true };
-  }
-
-  // 保险：已注册的账号直接跳过，不再打码/启动浏览器
-  const existingSessions = loadSessions();
-  const alreadyHasSession = existingSessions.find((s) => s.email.toLowerCase() === email.toLowerCase());
-  if (alreadyHasSession) {
-    taskLog(taskId, `⚠ ${email} 已注册过（已有 session），跳过，不重复打码`);
-    return { success: false, email, sessionId: alreadyHasSession.sessionId, error: "已注册过，跳过", skipped: true };
-  }
-
-  // 标记账号为注册中
-  registeringAccounts.add(email.toLowerCase());
-
   const result = { success: false, email, sessionId: null, error: null };
-  let browser = null, context = null;
   const startedAt = Date.now();
 
-  try {
-    taskLog(taskId, `开始注册: ${email}`);
-    // 派发后到启动浏览器之间可能已请求停止，直接退出不浪费资源
-    if (stopRequested) { result.error = "已停止"; return result; }
-    const proxy = parseProxy(CONFIG.PROXY_URL);
-    if (proxy) taskLog(taskId, `使用代理: ${proxy.server}${proxy.username ? " (带鉴权)" : ""}`);
-    const launchOpts = { headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO };
-    if (proxy) launchOpts.proxy = proxy;
-    browser = await chromium.launch(launchOpts);
-    activeBrowsers.add(browser);  // 登记，停止时能主动关掉释放 CPU
-    // 启动后简单验证代理是否生效：若 newContext 失败多半是代理连不上
-    try {
-      context = await browser.newContext({
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        viewport: { width: 1280, height: 800 },
-        locale: "en-US",
-      });
-      applyTrafficSaver(context);
-    } catch (e) {
-      if (proxy) {
-        taskLog(taskId, `⚠ 代理连接失败: ${e.message}，跳过该账号`);
-        result.error = `代理连接失败: ${e.message}`;
-        return result;
-      }
-      throw e;
+  if (account.skip === true) { result.error = "已跳过"; return { ...result, skipped: true }; }
+  const existing = loadSessions().find((s) => s.email.toLowerCase() === email.toLowerCase());
+  if (existing) {
+    taskLog(taskId, `⚠ ${email} 已注册过，跳过`);
+    return { ...result, sessionId: existing.sessionId, error: "已注册过，跳过", skipped: true };
+  }
+  registeringAccounts.add(email.toLowerCase());
+  taskLog(taskId, `开始注册(API): ${email}`);
+
+  // cookie jar + 可选代理
+  const cookies = {};
+  let dispatcher = null;
+  if (CONFIG.PROXY_URL) {
+    try { dispatcher = new ProxyAgent(CONFIG.PROXY_URL); taskLog(taskId, `使用代理: ${CONFIG.PROXY_URL.replace(/:[^:@]+@/, ":***@")}`); }
+    catch (e) { taskLog(taskId, `⚠ 代理初始化失败，改直连: ${e.message}`); }
+  }
+  const baseOpts = dispatcher ? { dispatcher } : {};
+  const cookieHeader = () => Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+  const parseSetCookie = (headers) => {
+    const sc = headers.get("set-cookie"); if (!sc) return;
+    for (const c of sc.split(/,(?=[^;]+?=)/)) {
+      const m = c.match(/^([^=;]+)=([^;]*)/);
+      if (m) cookies[m[1].trim()] = m[2].trim();
     }
-    const page = await context.newPage();
-
-    // ---- 早期 patch turnstile.render，拦截 callback ----
-    await page.addInitScript(() => {
-      let tsObj = null;
-      const interval = setInterval(() => {
-        if (window.turnstile && window.turnstile !== tsObj && window.turnstile.render) {
-          tsObj = window.turnstile;
-          const origRender = tsObj.render;
-          tsObj.render = function (container, params) {
-            if (params) { window.__tsCallback = params.callback; }
-            try { return origRender.apply(this, arguments); } catch (e) {}
-          };
-          clearInterval(interval);
-        }
-      }, 20);
-      setTimeout(() => clearInterval(interval), 15000);
-    });
-
-    // 监听验证码发送 API 响应
-    let codeSendResult = null;
-    page.on("response", async (response) => {
-      if (response.url().includes("api/login/email/code/send")) {
-        try { codeSendResult = await response.json(); } catch (e) {}
-      }
-    });
-
-    // ---- 1. 打开页面（优先邀请链接） ----
-    const allCodes = getAllInviteCodes();
-    const inviteCode = allCodes.length > 0
-      ? allCodes[Math.floor(Math.random() * allCodes.length)]
-      : "";
-
-    if (inviteCode) {
-      taskLog(taskId, `使用邀请码: ${inviteCode} (共 ${allCodes.length} 个可用)`);
-      await page.goto(`https://zenmux.ai/invite/${inviteCode}`, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    } else {
-      taskLog(taskId, "打开 ZenMux（无可用邀请码）...");
-      await page.goto("https://zenmux.ai", { waitUntil: "domcontentloaded", timeout: 60_000 });
-    }
-    // 不用 networkidle（ZenMux 有长连接/轮询，networkidle 可能永不触发导致 60s 超时）
-    // 后面有 waitForSelector("Continue with Email", 15s) 兜底等按钮渲染
-
-    // ---- 2. Sign In ----
-    taskLog(taskId, "查找 Sign In...");
-    for (const sel of ['button:has-text("Sign In")', 'a:has-text("Sign In")']) {
+  };
+  async function api(method, urlPath, body) {
+    const ct = cookies["ctoken"] || "";
+    const url = `https://zenmux.ai${urlPath}${urlPath.includes("?") ? "&" : "?"}ctoken=${ct}`;
+    const headers = { Accept: "application/json", Cookie: cookieHeader() };
+    if (body) headers["Content-Type"] = "application/json";
+    // 重试：网络错误(fetch failed) + 服务端瞬时错误(500/502/503)，最多3次
+    // （429限流/400逻辑错误不重试——重试也没用）
+    let lastErr;
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 2000 })) { await el.click(); break; }
-      } catch (e) {}
-    }
-    await sleep(2000);
-
-    // Continue with Email
-    // 邀请页加载较慢（约5-6s才渲染出按钮）。等按钮出现（15s 上限），稍等 React 挂上 onClick，再用 JS click 触发
-    // （Playwright 坐标点击有时不触发 React onClick，JS .click() 更可靠）
-    taskLog(taskId, "点击 Continue with Email...");
-    await page.waitForSelector("text=Continue with Email", { timeout: 15_000 }).catch(() => {});
-    await sleep(500);  // 等 React 把 onClick 挂到按钮上
-    let clickedText = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll("button, a, [role='button']"));
-      const t = (e) => (e.textContent || "").trim().toLowerCase();
-      const target = els.find(e => t(e).includes("continue with email"));
-      if (target) { target.click(); return target.textContent.trim(); }
-      return null;
-    });
-    if (clickedText) taskLog(taskId, `✓ 已点击 (JS): "${clickedText}"`);
-    else {
-      taskLog(taskId, `⚠ 没找到 Continue with Email 元素，列页面按钮...`);
-      const allBtns = await page.evaluate(() => Array.from(document.querySelectorAll("button,a")).map(b => (b.textContent||"").trim()).filter(Boolean).slice(0, 15));
-      taskLog(taskId, `  页面按钮: ${JSON.stringify(allBtns)}`);
-    }
-    // 点完等邮箱框出现（最多 10s）
-    await page.waitForSelector('input[type="email"], input#email, input[placeholder*="email" i]', { timeout: 10_000 }).catch(() => {});
-
-    // ---- 3. 填邮箱 ----
-    let emailInput = null;
-    for (const sel of ['input[id="email"]', 'input[type="email"]', 'input[placeholder*="email" i]']) {
-      try {
-        const els = await page.$$(sel);
-        for (const el of els) {
-          if (await el.isVisible()) { emailInput = el; break; }
+        const r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, ...baseOpts });
+        parseSetCookie(r.headers);
+        const text = await r.text();
+        let data; try { data = JSON.parse(text); } catch { data = text; }
+        if ([500, 502, 503].includes(r.status) && attempt < 3) {
+          lastErr = new Error(`HTTP ${r.status} ${JSON.stringify(data).slice(0, 80)}`);
+          await sleep(2000 * attempt);
+          continue;
         }
-        if (emailInput) break;
-      } catch (e) {}
-    }
-    if (!emailInput) {
-      // 找不到邮箱框：截图 + 抓页面可见文本，便于排查（代理被风控/页面改版/弹窗不同）
-      try {
-        await page.screenshot({ path: `/tmp/zenmux_no_email_${email.replace(/[^a-z0-9]/gi, "_")}_${Date.now()}.png` });
-        const txt = await page.evaluate(() => (document.body?.innerText || "").slice(0, 500));
-        taskLog(taskId, `❌ 找不到邮箱输入框，URL=${page.url()} 页面文本: ${JSON.stringify(txt.slice(0, 300))}`);
-      } catch (e) { taskLog(taskId, `❌ 找不到邮箱输入框 (截图失败: ${e.message})`); }
-      result.error = "找不到邮箱输入框";
-      return result;
-    }
-    await emailInput.click({ clickCount: 3 });
-    await emailInput.fill(email);
-    taskLog(taskId, `已输入邮箱: ${email}`);
-    await sleep(1000);
-
-    // ---- 4. 邀请码（如果页面有单独输入框且未通过链接自动填入） ----
-    if (inviteCode) {
-      for (const sel of ['input[placeholder*="invite" i]', 'input[placeholder*="邀请" i]']) {
-        try {
-          const els = await page.$$(sel);
-          for (const el of els) {
-            if (await el.isVisible().catch(() => false)) {
-              const val = await el.inputValue().catch(() => "");
-              if (!val) {
-                await el.click({ clickCount: 3 });
-                await el.fill(inviteCode);
-                taskLog(taskId, `已输入邀请码: ${inviteCode}`);
-              }
-              break;
-            }
-          }
-        } catch (e) {}
-      }
-    }
-
-    // ---- 5. Turnstile（先探测是否需要打码，再决定是否调用 CapSolver） ----
-    taskLog(taskId, "检测是否需要 Turnstile 打码...");
-
-    // 先等一下，看 Turnstile managed 模式是否会自动通过
-    let turnstileSolved = false;
-    let needCapSolver = false;
-
-    // 检测页面状态：是否有 Turnstile widget、Send 按钮是否已启用
-    async function detectTurnstileState() {
-      return await page.evaluate(() => {
-        const result = {
-          hasWidget: false,
-          hasToken: false,
-          sendEnabled: false,
-          sendDisabled: false,
-        };
-        // 是否存在 turnstile widget / iframe / 输入框
-        const hasIframe = !!document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-        const hasInput = !!document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-        const hasContainer = !!document.querySelector('[data-sitekey], .cf-turnstile, [class*="turnstile" i]');
-        result.hasWidget = hasIframe || hasInput || hasContainer;
-
-        // 是否已有 token（managed 模式自动通过）
-        const tokenInputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-        for (const input of tokenInputs) {
-          if (input.value && input.value.length > 20) { result.hasToken = true; break; }
-        }
-
-        // Send 按钮状态
-        const send = Array.from(document.querySelectorAll("button")).filter(e => e.offsetParent).find(b => (b.textContent || "").includes("Send"));
-        if (send) {
-          result.sendEnabled = !send.disabled;
-          result.sendDisabled = send.disabled;
-        }
-        return result;
-      });
-    }
-
-    // 先等最多 8 秒，看是否自动通过 / Send 是否已启用
-    for (let i = 0; i < 8; i++) {
-      const st = await detectTurnstileState();
-      if (st.hasToken || st.sendEnabled) {
-        turnstileSolved = true;
-        taskLog(taskId, `✓ Turnstile 自动通过 / Send 已启用，无需打码`);
-        break;
-      }
-      // 还没通过，但存在 widget 且 Send 被禁用 → 需要打码
-      if (st.hasWidget && st.sendDisabled) {
-        // 再等一会确认不是刚加载
-        if (i >= 2) {
-          needCapSolver = true;
-          break;
-        }
-      }
-      // 没有 widget 且 Send 已启用 → 不需要打码
-      if (!st.hasWidget && st.sendEnabled) {
-        turnstileSolved = true;
-        taskLog(taskId, `✓ 页面无 Turnstile，Send 已启用，无需打码`);
-        break;
-      }
-      await sleep(1000);
-    }
-
-    // 确认一次最终状态
-    if (!turnstileSolved) {
-      const st = await detectTurnstileState();
-      if (st.hasToken || st.sendEnabled) {
-        turnstileSolved = true;
-        taskLog(taskId, `✓ Send 已启用，无需打码`);
-      } else if (st.hasWidget && st.sendDisabled) {
-        needCapSolver = true;
-      } else if (!st.hasWidget) {
-        // 没有 widget，可能页面结构不同，标记为已解决避免卡住
-        turnstileSolved = true;
-        taskLog(taskId, `⚠ 未检测到 Turnstile widget，跳过打码`);
-      }
-    }
-
-    // 只有确认需要打码时才调用 CapSolver（省钱）。失败自动重试最多 3 次。
-    if (needCapSolver && !turnstileSolved && CONFIG.CAPSOLVER_API_KEY) {
-      // 提取 sitekey
-      let sitekey = await page.evaluate(() => {
-        const container = document.querySelector('[data-sitekey]');
-        if (container) return container.getAttribute("data-sitekey");
-        const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-        if (iframe) { const m = iframe.src.match(/sitekey=([^&]+)/); if (m) return decodeURIComponent(m[1]); }
-        return null;
-      });
-
-      if (!sitekey) {
-        const cfRequests = [];
-        const handler = req => { if (req.url().includes('challenges.cloudflare.com/turnstile')) cfRequests.push(req.url()); };
-        page.on('request', handler);
-        await sleep(2000);
-        page.off('request', handler);
-        for (const url of cfRequests) {
-          const m = url.match(/\/0x[A-Fa-f0-9]{20,}\//);
-          if (m) { sitekey = m[0].replace(/\//g, ''); break; }
-        }
-      }
-      if (!sitekey) sitekey = "0x4AAAAAAB3vWB8HhhtIcASj";
-
-      taskLog(taskId, `检测到需要 Turnstile 打码，sitekey: ${sitekey.slice(0, 20)}...`);
-
-      const MAX_TURNSTILE_RETRY = 3;
-      for (let attempt = 1; attempt <= MAX_TURNSTILE_RETRY && !turnstileSolved; attempt++) {
-        taskLog(taskId, `调用 CapSolver (第 ${attempt}/${MAX_TURNSTILE_RETRY} 次)...`);
-        try {
-          const solution = await solveTurnstile({
-            apiKey: CONFIG.CAPSOLVER_API_KEY,
-            websiteURL: page.url(),
-            websiteKey: sitekey,
-          });
-
-          taskLog(taskId, `CapSolver token: ${solution.token.slice(0, 30)}...`);
-
-          // 注入 token + 调用 callback
-          const injected = await page.evaluate((token) => {
-            const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-            for (const input of inputs) {
-              input.value = token;
-              input.dispatchEvent(new Event("change", { bubbles: true }));
-              input.dispatchEvent(new Event("input", { bubbles: true }));
-            }
-            let cbCalled = false;
-            if (typeof window.__tsCallback === "function") {
-              try { window.__tsCallback(token); cbCalled = true; } catch (e) {}
-            }
-            return cbCalled;
-          }, solution.token);
-
-          if (injected) {
-            turnstileSolved = true;
-            taskLog(taskId, "✓ Turnstile 已解决 (callback 已调用)");
-          } else {
-            // 备用: 直接设置 input
-            await page.evaluate((token) => {
-              let input = document.querySelector('input[name="cf-turnstile-response"]');
-              if (!input) {
-                input = document.createElement("input");
-                input.type = "hidden";
-                input.name = "cf-turnstile-response";
-                document.body.appendChild(input);
-              }
-              input.value = token;
-            }, solution.token);
-            turnstileSolved = true;
-            taskLog(taskId, "✓ Turnstile 已解决 (备用注入)");
-          }
-        } catch (e) {
-          taskLog(taskId, `CapSolver 第 ${attempt} 次失败: ${e.message}`);
-          if (attempt < MAX_TURNSTILE_RETRY) {
-            taskLog(taskId, "等待 2s 后重试...");
-            await sleep(2000);
-          }
-        }
-      }
-      if (!turnstileSolved) {
-        taskLog(taskId, `⚠ Turnstile 打码 ${MAX_TURNSTILE_RETRY} 次均失败`);
-      }
-    } else if (!turnstileSolved) {
-      taskLog(taskId, "未确认是否需要打码，等待 Turnstile 自动通过...");
-    }
-
-    // 回退: 等待自动通过
-    if (!turnstileSolved) {
-      taskLog(taskId, "等待 Turnstile 自动通过...");
-      const start = Date.now();
-      while (Date.now() - start < 60_000) {
-        const token = await page.evaluate(() => {
-          const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-          for (const input of inputs) { if (input.value?.length > 20) return input.value; }
-          return null;
-        });
-        if (token) { turnstileSolved = true; break; }
-        await sleep(1500);
-      }
-    }
-
-    // ---- 6. 等待 Send Email 按钮启用 ----
-    if (turnstileSolved) {
-      for (let i = 0; i < 20; i++) {
-        await sleep(500);
-        const enabled = await page.evaluate(() => {
-          const send = Array.from(document.querySelectorAll("button")).filter(e => e.offsetParent).find(b => (b.textContent || "").includes("Send"));
-          return send ? !send.disabled : false;
-        });
-        if (enabled) { taskLog(taskId, "✓ Send Email 按钮已启用"); break; }
-      }
-    }
-
-    // ---- 7+8. 点击发送验证码并获取（第1轮等65s，第2轮等15s，都没收到就跳过）----
-    // 第1轮：65s（覆盖邮件投递延迟 + ZenMux Send 重发冷却60s）
-    // 第2轮：15s（重发冷却刚结束，邮件通常已到，短等即可）
-    // 都没收到 → 直接跳过该账号
-    const SEND_ROUNDS = [
-      { wait: 65_000, label: "第1轮（等65s）" },
-      { wait: 15_000, label: "第2轮（等15s）" },
-    ];
-    let code = null;
-    for (let round = 0; round < SEND_ROUNDS.length && !code; round++) {
-      const { wait, label } = SEND_ROUNDS[round];
-      taskLog(taskId, round === 0 ? `点击发送验证码... (${label})` : `未收到验证码，重新点击发送... (${label})`);
-
-      // 找 Send 按钮
-      let sendBtn = null;
-      for (const sel of ['button:has-text("Send Email")', 'button:has-text("Send")']) {
-        try {
-          const el = page.locator(sel).first();
-          if (await el.isVisible({ timeout: 2000 })) { sendBtn = el; break; }
-        } catch (e) {}
-      }
-      if (sendBtn) {
-        const isDisabled = await sendBtn.isDisabled().catch(() => false);
-        if (isDisabled) {
-          await page.evaluate(() => {
-            document.querySelectorAll('button[disabled]').forEach((btn) => {
-              if ((btn.textContent || "").toLowerCase().includes("send")) {
-                btn.disabled = false;
-                btn.removeAttribute("disabled");
-              }
-            });
-          });
-        }
-        await sendBtn.click({ force: true });
-      }
-
-      // 点击发送后，邮件投递有延迟；先等 1 秒再开始轮询
-      await sleep(1000);
-      // 记录发送验证码的时刻，只接受这之后到达的邮件（避免读到旧验证码）
-      const codeSendTime = Date.now();
-      // 直接用 hotmail_helper 取码，本轮等待 wait 毫秒
-      code = await fetchVerificationCode(email, refresh_token, client_id, taskId, codeSendTime, wait);
-      if (code) {
-        taskLog(taskId, `验证码: ${code}`);
-        break;
-      }
-    }
-    if (!code) { result.error = "获取验证码超时（两轮均未收到）"; return result; }
-
-    // ---- 9. 输入验证码 ----
-    await sleep(2000);
-
-    // 先尝试 OTP 多框
-    const otpInputs = await page.$$('input[maxlength="1"]');
-    if (otpInputs.length === 6) {
-      for (let i = 0; i < 6; i++) {
-        await otpInputs[i].click();
-        await otpInputs[i].fill(code[i]);
-        await sleep(100);
-      }
-      taskLog(taskId, "已输入验证码 (多框 OTP)");
-    } else {
-      // 单框 OTP: 用 type() 逐位触发 React onChange，delay 稍慢确保每位都触发
-      const otpSingle = await page.$('input.otpNativeInput-LCOdN2Gu, input[maxlength="6"]');
-      if (otpSingle && await otpSingle.isVisible().catch(() => false)) {
-        await otpSingle.click();
-        await otpSingle.type(code, { delay: 120 });
-        // 校验是否真的输满 6 位（React 偶尔吞掉末位），少了就补齐
-        const filled = await otpSingle.inputValue().catch(() => "");
-        if (filled.length < 6) {
-          taskLog(taskId, `⚠ OTP 只输进去 ${filled.length} 位，补齐重输`);
-          await otpSingle.click({ clickCount: 3 });
-          await otpSingle.fill("");
-          await otpSingle.type(code, { delay: 150 });
-        }
-        taskLog(taskId, "已输入验证码 (单框 OTP type)");
-      } else {
-        // 普通输入框
-        for (const sel of ['input[placeholder*="code" i]', 'input[type="text"]']) {
-          try {
-            const els = await page.$$(sel);
-            for (const el of els) {
-              if (await el.isVisible().catch(() => false)) {
-                await el.click({ clickCount: 3 });
-                await el.type(code, { delay: 100 });
-                taskLog(taskId, "已输入验证码 (普通输入框)");
-                break;
-              }
-            }
-          } catch (e) {}
-        }
-      }
-    }
-
-    taskLog(taskId, "验证码已输入，等待登录...");
-
-    // 单框 OTP 可能不会自动提交：输完 6 位若没有"Verify/Continue"按钮可点，
-    // 尝试按回车触发提交（点错不报错）。
-    try { await page.keyboard.press("Enter"); } catch (e) {}
-
-    // ---- 9.5 二次验证探测 + 打码 ----
-    // 输完验证码后，ZenMux 可能要求二次验证（实测是 reCAPTCHA，sitekey 6LdN_REsAAAAAKSlH2k4...）。
-    // 关键教训：ZenMux 登录是弹窗，输验证码时 URL 仍是 zenmux.ai/ 或 /invite/xxx，
-    // 用宽松 URL/cookie 判断会误判"已登录"而跳过二次验证 → 注册失败。
-    // 所以登录成功的唯一硬证据 = /api/referral/info 返回 200。
-    // 既然登录判定是硬的（不会误判），就不需要强制长时间等待再开始探测 ——
-    // 直接轮询：出现二次验证 widget 就打码，referral/info 返回 200 就算登录成功，都没有就继续等。
-    // 仅留 5s 缓冲，让 OTP 提交的请求先发出去、二次验证 widget 有时间渲染。
-    await sleep(5000);
-
-    // 探测：一直轮询直到 出现二次验证 / 硬登录成功 / 超时
-    async function detectSecondaryCaptcha() {
-      return await page.evaluate(() => {
-        const r = { need: false, type: null, sitekey: null, action: null, hasToken: false };
-        // 任一验证 token 已就位 → 已自动通过，无需打码
-        const tokenInputs = document.querySelectorAll(
-          'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], #g-recaptcha-response, textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"]'
-        );
-        for (const input of tokenInputs) {
-          if (input.value && input.value.length > 20) { r.hasToken = true; break; }
-        }
-        if (r.hasToken) return r;
-        // reCAPTCHA（明确特征）
-        const recaptchaDiv = document.querySelector('.g-recaptcha[data-sitekey], .g-recaptcha');
-        const recaptchaIframe = document.querySelector('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]');
-        if (recaptchaDiv || recaptchaIframe) {
-          r.need = true; r.type = "recaptcha";
-          if (recaptchaDiv) r.sitekey = recaptchaDiv.getAttribute("data-sitekey");
-          if (recaptchaIframe) { const m = recaptchaIframe.src.match(/[?&]k=([^&]+)/); if (m) r.sitekey = decodeURIComponent(m[1]); }
-          const sc = Array.from(document.querySelectorAll('script')).find(s => /grecaptcha\.execute/.test(s.textContent || ''));
-          if (sc) {
-            const m = (sc.textContent || '').match(/grecaptcha\.execute\([^,]+,\s*\{action:\s*['"]([^'"]+)['"]/);
-            if (m) r.action = m[1];
-            if (!recaptchaDiv) r.type = "recaptcha_v3";
-          }
-          return r;
-        }
-        // hCaptcha
-        const hcDiv = document.querySelector('.h-captcha[data-sitekey], .h-captcha');
-        const hcIframe = document.querySelector('iframe[src*="hcaptcha.com"]');
-        if (hcDiv || hcIframe) {
-          r.need = true; r.type = "hcaptcha";
-          if (hcDiv) r.sitekey = hcDiv.getAttribute("data-sitekey");
-          if (hcIframe) { const m = hcIframe.src.match(/sitekey=([^&]+)/); if (m) r.sitekey = decodeURIComponent(m[1]); }
-          return r;
-        }
-        // Cloudflare Turnstile（只认硬特征）
-        const tsDiv = document.querySelector('.cf-turnstile[data-sitekey], .cf-turnstile');
-        const tsIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-        if (tsDiv || tsIframe) {
-          r.need = true; r.type = "turnstile";
-          if (tsDiv) r.sitekey = tsDiv.getAttribute("data-sitekey");
-          if (tsIframe) { const m = tsIframe.src.match(/sitekey=([^&]+)/); if (m) r.sitekey = decodeURIComponent(m[1]); }
-        }
-        return r;
-      });
-    }
-    let secondary = null;
-    let loginDetectedEarly = false;
-    for (let i = 0; i < 45; i++) {  // 45 × 2s = 最多再 90s（前面已等 5s 缓冲）
-      if (stopRequested) break;  // 已停止 → 不再轮询
-      secondary = await detectSecondaryCaptcha();
-      if (secondary.need || secondary.hasToken) break;
-      // 登录成功的唯一硬证据：/api/referral/info 返回 200（非 401）。
-      // 服务端真正下发有效 session、且账号已验证通过才会 200。
-      // sessionId cookie / URL 都不可信（弹窗登录 URL 不变，cookie 可能是无效 session）。
-      try {
-        const probe = await page.evaluate(async () => {
-          const r = await fetch("/api/referral/info", { headers: { "Accept": "application/json" }, credentials: "include" });
-          return r.ok ? { ok: true } : { ok: false, status: r.status };
-        });
-        if (probe && probe.ok) { loginDetectedEarly = true; break; }
-      } catch (e) {}
-      await sleep(2000);
-    }
-
-    if (secondary && secondary.need) {
-      taskLog(taskId, `⚠ 检测到二次验证：${secondary.type}，打码...`);
-      try {
-        let sitekey = secondary.sitekey;
-        // reCAPTCHA 没取到 sitekey → 兜底（实测 ZenMux 二次验证 reCAPTCHA sitekey）
-        if (!sitekey && (secondary.type === "recaptcha" || secondary.type === "recaptcha_v3")) {
-          sitekey = "6LdN_REsAAAAAKSlH2k4VNXo";  // 日志实测的二次验证 sitekey
-          taskLog(taskId, `⚠ 未从页面取到 reCAPTCHA sitekey，使用兜底值`);
-        }
-        // Turnstile 兜底
-        if (!sitekey && secondary.type === "turnstile") {
-          const cfRequests = [];
-          const handler = req => { if (req.url().includes('challenges.cloudflare.com/turnstile')) cfRequests.push(req.url()); };
-          page.on('request', handler); await sleep(2000); page.off('request', handler);
-          for (const url of cfRequests) { const m = url.match(/\/0x[A-Fa-f0-9]{20,}\//); if (m) { sitekey = m[0].replace(/\//g, ''); break; } }
-          if (!sitekey) sitekey = "0x4AAAAAAB3vWB8HhhtIcASj";
-        }
-
-        taskLog(taskId, `二次验证类型: ${secondary.type}, sitekey: ${(sitekey || "").slice(0, 24)}...`);
-        await solveSecondaryCaptcha(page, taskId, secondary, sitekey);
-        await sleep(1500);
-        await clickSecondarySubmit(page, taskId);
+        return { status: r.status, data };
       } catch (e) {
-        taskLog(taskId, `二次打码失败: ${e.message}`);
-      }
-    } else {
-      if (loginDetectedEarly) {
-        taskLog(taskId, "✓ 已登录成功，无需二次验证");
-      } else {
-        taskLog(taskId, secondary && secondary.hasToken ? "✓ 二次验证已自动通过，无需打码" : "⚠ 60s 内未检测到二次验证，也未登录成功，继续等待登录");
+        lastErr = e;
+        if (attempt < 3) await sleep(2000 * attempt);
       }
     }
+    throw lastErr;
+  }
 
-    // ---- 10. 等待登录（硬判定：referral/info 返回 200 才算真正登录成功） ----
-    // 不用 URL / cookie 判断（ZenMux 是弹窗登录，URL 不变，cookie 可能是无效 session）。
-    // 唯一硬证据：/api/referral/info 返回 200。轮询最多 60s。
-    let trulyLoggedIn = false;
-    let sessionId = null;
-    const loginDeadline = Date.now() + 60_000;
-    while (Date.now() < loginDeadline) {
-      if (stopRequested) break;  // 已停止 → 不再等登录
-      await sleep(2000);
-      try {
-        const probe = await page.evaluate(async () => {
-          const r = await fetch("/api/referral/info", { headers: { "Accept": "application/json" }, credentials: "include" });
-          return r.ok ? { ok: true } : { ok: false, status: r.status };
-        });
-        if (probe && probe.ok) { trulyLoggedIn = true; break; }
-      } catch (e) {}
+  try {
+    if (stopRequested) { result.error = "已停止"; return result; }
+
+    // 0. 取 ctoken（带重试，代理可能抽风）
+    let r0;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try { r0 = await fetch("https://zenmux.ai/api/frontend/public/appData", baseOpts); break; }
+      catch (e) { if (attempt < 3) await sleep(2000 * attempt); else throw e; }
     }
-    if (trulyLoggedIn) {
-      const cookies = await context.cookies();
-      sessionId = cookies.find((c) => c.name === "sessionId");
+    parseSetCookie(r0.headers);
+    if (!cookies["ctoken"]) throw new Error("未取到 ctoken");
+
+    // 1. 绑定邀请码
+    const allCodes = getAllInviteCodes();
+    const inviteCode = allCodes.length > 0 ? allCodes[Math.floor(Math.random() * allCodes.length)] : "";
+    if (inviteCode) {
+      taskLog(taskId, `使用邀请码: ${inviteCode}`);
+      const r1 = await api("GET", `/api/get_invite_user?inviteCode=${inviteCode}`);
+      if (r1.status !== 200) taskLog(taskId, `⚠ get_invite_user ${r1.status}`);
     }
 
-    if (trulyLoggedIn) {
-      const storageState = await context.storageState();
-      const statePath = path.join(SESSIONS_DIR, `${email.replace(/[@.]/g, "_")}.json`);
-      fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-      fs.writeFileSync(statePath, JSON.stringify(storageState, null, 2));
+    if (stopRequested) { result.error = "已停止"; return result; }
 
-      result.success = true;
-      result.sessionId = sessionId?.value || null;
-      taskLog(taskId, `✅ 注册成功: ${email} | Session: ${result.sessionId}`);
+    // 2. Turnstile
+    taskLog(taskId, "CapSolver 解 Turnstile...");
+    const ts = await solveTurnstile({ apiKey: CONFIG.CAPSOLVER_API_KEY, websiteURL: "https://zenmux.ai", websiteKey: TURNSTILE_SITEKEY });
+    taskLog(taskId, `✓ Turnstile token: ${ts.token.slice(0, 24)}...`);
 
-      // 保存结果
-      fs.mkdirSync(RESULTS_DIR, { recursive: true });
-      const summaryPath = path.join(RESULTS_DIR, "summary.jsonl");
-      fs.appendFileSync(summaryPath, JSON.stringify({
-        email, timestamp: new Date().toISOString(), success: true,
-        sessionId: result.sessionId, statePath,
-      }) + "\n");
+    // 3. send
+    taskLog(taskId, `[${email}] 发送验证码...`);
+    const r2 = await api("POST", "/api/login/email/code/send", { email, token: ts.token });
+    taskLog(taskId, `[${email}] send: ${r2.status}`);
+    if (r2.status !== 200) throw new Error(`发送验证码失败 ${r2.status} ${JSON.stringify(r2.data).slice(0, 100)}`);
 
-      // 自动提取该账号的邀请码（用于后续轮换）
-      // 停止则跳过后续收尾（邀请码提取/建 key/导入），账号已注册成功，下次再补
-      if (stopRequested) {
-        taskLog(taskId, `⏹ 已停止，跳过邀请码提取与 API key 创建: ${email}`);
-      } else {
-        // session 已保存到文件，后续邀请码提取/建 key 改用直调 API（不用浏览器，省流量）
-        // 先关掉浏览器，避免它继续跑后台请求/占用资源
-        try { await context.close(); } catch (e) {}
-        activeBrowsers.delete(browser);
-        if (browser) { try { await browser.close(); } catch (e) {} }
-        browser = null;
+    if (stopRequested) { result.error = "已停止"; return result; }
 
-        await extractInviteCode(email, taskId);
+    // 4. 取验证码（复用 hotmail_helper，带时间过滤）
+    const code = await fetchVerificationCode(email, refresh_token, client_id, taskId, Date.now(), 65_000);
+    if (!code) throw new Error("获取验证码超时");
+    taskLog(taskId, `[${email}] 验证码: ${code}`);
 
-        // 自动创建 API key：Pay API（按量付费 sk-ai-v1）+ Platform API（平台管理 sk-mg-v1）
-        await ensureApiKey(email, taskId, "pay");
-        await ensureApiKey(email, taskId, "platform");
+    if (stopRequested) { result.error = "已停止"; return result; }
+
+    // 5. verify（若报 Invalid or expired，可能是取到旧码，等新码重取重试一次）
+    let r3 = await api("POST", "/api/login/email/code/verify", { email, code });
+    taskLog(taskId, `[${email}] verify: ${r3.status}`);
+    if (r3.status !== 200) {
+      const msg = JSON.stringify(r3.data || {});
+      if (/invalid|expired|无效|过期/i.test(msg)) {
+        taskLog(taskId, `[${email}] 验证码无效，等 8s 重取新码重试...`);
+        await sleep(8000);
+        const code2 = await fetchVerificationCode(email, refresh_token, client_id, taskId, Date.now() - 60_000, 30_000);
+        if (code2 && code2 !== code) {
+          r3 = await api("POST", "/api/login/email/code/verify", { email, code: code2 });
+          taskLog(taskId, `[${email}] verify(重试): ${r3.status}`);
+        }
       }
-    } else {
-      result.error = "登录未完成（referral/info 未返回 200）";
-      taskLog(taskId, `❌ 注册失败: ${email} (${result.error})`);
+      if (r3.status !== 200) throw new Error(`[${email}] 验证码校验失败 ${r3.status} ${JSON.stringify(r3.data).slice(0, 100)}`);
+    }
+
+    // 5.5 检查是否已登录
+    let rInfo = await api("GET", "/api/referral/info");
+    if (rInfo.status !== 200) {
+      // 6. 需要二次 reCAPTCHA
+      taskLog(taskId, `[${email}] 需二次验证，CapSolver 解 reCAPTCHA...`);
+      const rc = await solveRecaptchaV2({ apiKey: CONFIG.CAPSOLVER_API_KEY, websiteURL: "https://zenmux.ai", websiteKey: RECAPTCHA_SITEKEY });
+      taskLog(taskId, `[${email}] ✓ reCAPTCHA token: ${rc.token.slice(0, 24)}...`);
+      const r4 = await api("POST", "/api/login/recaptcha/verification", { token: rc.token });
+      taskLog(taskId, `[${email}] recaptcha: ${r4.status}`);
+      if (r4.status !== 200) throw new Error(`[${email}] 二次验证失败 ${r4.status} ${JSON.stringify(r4.data).slice(0, 100)}`);
+      rInfo = await api("GET", "/api/referral/info");
+    }
+
+    if (rInfo.status !== 200) throw new Error(`登录未完成 referral/info=${rInfo.status}`);
+
+    // 7. 保存 session（storageState 格式，兼容现有面板/zenmuxApiRequest）
+    const sessionId = cookies["sessionId"] || "";
+    const storageState = { cookies: Object.entries(cookies).map(([name, value]) => ({ name, value, domain: "zenmux.ai", path: "/", httpOnly: false, secure: true, sameSite: "Lax" })) };
+    const statePath = path.join(SESSIONS_DIR, `${email.replace(/[@.]/g, "_")}.json`);
+    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+    fs.writeFileSync(statePath, JSON.stringify(storageState, null, 2));
+
+    result.success = true;
+    result.sessionId = sessionId;
+    taskLog(taskId, `✅ 注册成功(API): ${email} | Session: ${sessionId}`);
+
+    fs.mkdirSync(RESULTS_DIR, { recursive: true });
+    fs.appendFileSync(path.join(RESULTS_DIR, "summary.jsonl"), JSON.stringify({ email, timestamp: new Date().toISOString(), success: true, sessionId, statePath }) + "\n");
+
+    // 8. 收尾：提取邀请码 + 建 key（复用直调 API，读 session 文件）
+    if (!stopRequested) {
+      await extractInviteCode(email, taskId);
+      await ensureApiKey(email, taskId, "pay");
+      await ensureApiKey(email, taskId, "platform");
     }
   } catch (e) {
-    // 停止导致的 browser 被关会抛 "Target page/context/browser has been closed"，别当成报错
-    if (stopRequested) {
-      result.error = "已停止";
-      taskLog(taskId, `⏹ 已停止: ${email}`);
-    } else {
-      result.error = e.message;
-      taskLog(taskId, `❌ 注册出错: ${e.message}`);
-    }
+    result.error = e.message;
+    taskLog(taskId, `❌ 注册出错(API): ${e.message}`);
   } finally {
-    // 移除注册中状态
     registeringAccounts.delete(email.toLowerCase());
-    activeBrowsers.delete(browser);
-    if (browser) { try { await browser.close(); } catch (e) {} }
-    taskLog(taskId, `结束注册: ${email} | 耗时 ${Math.round((Date.now() - startedAt) / 1000)}s | ${result.success ? "成功" : "失败"}`);
+    taskLog(taskId, `结束注册(API): ${email} | 耗时 ${Math.round((Date.now() - startedAt) / 1000)}s | ${result.success ? "成功" : "失败"}`);
   }
   return result;
 }
@@ -1606,15 +1111,16 @@ async function handleRequest(req, res) {
       const { accounts: newAccounts } = body;
       if (!Array.isArray(newAccounts)) return json(res, { ok: false, error: "格式错误" }, 400);
       const existing = loadAccounts();
-      let added = 0;
+      let added = 0, duplicate = 0, invalid = 0;
+      const dupEmails = [];
       for (const a of newAccounts) {
-        if (!a.email || !a.refresh_token || !a.client_id) continue;
-        if (existing.find((e) => e.email.toLowerCase() === a.email.toLowerCase())) continue;
+        if (!a.email || !a.refresh_token || !a.client_id) { invalid++; continue; }
+        if (existing.find((e) => e.email.toLowerCase() === a.email.toLowerCase())) { duplicate++; dupEmails.push(a.email); continue; }
         existing.push({ email: a.email, password: a.password || "", client_id: a.client_id, refresh_token: a.refresh_token });
         added++;
       }
       saveAccounts(existing);
-      return json(res, { ok: true, added });
+      return json(res, { ok: true, added, duplicate, invalid, dupEmails: dupEmails.slice(0, 20) });
     }
 
     // 注册结果
@@ -1645,7 +1151,6 @@ async function handleRequest(req, res) {
           autoInviteCodes: loadSavedInviteCodes(),
           allInviteCodes: getAllInviteCodes(),
           capsolverKey: CONFIG.CAPSOLVER_API_KEY ? CONFIG.CAPSOLVER_API_KEY.slice(0, 12) + "..." : "",
-          headless: CONFIG.HEADLESS,
           hotmailApi: CONFIG.HOTMAIL_API_BASE,
           concurrency: CONFIG.CONCURRENCY,
           maxConcurrency: 20,
@@ -1658,7 +1163,6 @@ async function handleRequest(req, res) {
     if (pathname === "/api/config" && req.method === "POST") {
       const body = await parseBody(req);
       if (body.inviteCodes !== undefined) CONFIG.INVITE_CODES = body.inviteCodes;
-      if (body.headless !== undefined) CONFIG.HEADLESS = body.headless;
       // 动态调整并发数（仅在无注册任务时生效，避免中途改信号量）
       if (body.concurrency !== undefined) {
         if (registering) {
@@ -1738,7 +1242,7 @@ async function handleRequest(req, res) {
       (async () => {
         try {
           if (account) {
-            const result = await registerAccount(account, taskId);
+            const result = await registerAccountApi(account, taskId);
             taskLog(taskId, `任务完成: ${result.success ? "成功" : "失败"}`);
           } else {
             // 批量注册：按 CONCURRENCY 并发派发
@@ -1763,7 +1267,7 @@ async function handleRequest(req, res) {
                 await regSemaphore.acquire();
                 try {
                   if (stopRequested) { taskLog(taskId, `⏹ 已请求停止，跳过 ${acc.email}`); return; }
-                  const result = await registerAccount(acc, taskId);
+                  const result = await registerAccountApi(acc, taskId);
                   results.push(result);
                 } catch (e) {
                   results.push({ success: false, email: acc.email, error: e.message });
@@ -1794,9 +1298,6 @@ async function handleRequest(req, res) {
     // 停止注册
     if (pathname === "/api/register/stop" && req.method === "POST") {
       stopRequested = true;
-      // 关键：主动关闭所有在跑浏览器，立刻释放 CPU
-      // （stopRequested 只能挡新号派发，对已在跑的号无效——必须靠关 browser 中断）
-      closeAllActiveBrowsers();
       return json(res, { ok: true });
     }
 
@@ -1905,7 +1406,7 @@ async function handleRequest(req, res) {
             // 无 session：先登录（流程同注册），登录成功会自动创建 pay+platform 两类 key
             if (!hasSession) {
               taskLog(taskId, `⚠ ${account.email} 无 session，先登录（流程同注册）...`);
-              const regResult = await registerAccount(account, taskId);
+              const regResult = await registerAccountApi(account, taskId);
               if (!regResult.success && !regResult.skipped) {
                 taskLog(taskId, `❌ 登录失败: ${regResult.error || "未知错误"}`);
                 return null;

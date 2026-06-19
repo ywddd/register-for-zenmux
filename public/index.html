@@ -716,7 +716,11 @@ async function importAccounts() {
   if (!accounts.length) return alert('未解析到有效账号，请检查格式：邮箱----密码----client_id----refresh_token');
   const data = await api('/api/accounts/import', { method: 'POST', body: JSON.stringify({ accounts }) });
   if (data.ok) {
-    alert(`成功导入 ${data.added} 个账号`);
+    let msg = `成功导入 ${data.added} 个账号`;
+    if (data.duplicate) msg += `\n重复忽略 ${data.duplicate} 个（已在账号列表里）`;
+    if (data.invalid) msg += `\n格式无效 ${data.invalid} 个（缺 email/client_id/refresh_token）`;
+    if (data.dupEmails && data.dupEmails.length) msg += `\n重复邮箱: ${data.dupEmails.join(', ')}`;
+    alert(msg);
     document.getElementById('importArea').value = '';
     loadAccounts();
   } else {

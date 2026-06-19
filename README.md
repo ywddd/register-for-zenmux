@@ -1,30 +1,30 @@
 # ZenMux 注册管理面板
 
-自动化 ZenMux.ai 账号注册工具，支持 Web 管理面板、批量注册、验证码自动获取、自动创建平台 API Key，并可一键导入 gpt-load。
+自动化 ZenMux.ai 账号注册工具，纯 API 直调（不开浏览器），支持 Web 管理面板、批量注册、验证码自动获取、自动创建平台 API Key，并可一键导入 gpt-load。
 
 ## 功能特性
 
-- 🚀 **自动化注册** - Playwright 驱动浏览器完成注册全流程
-- 🛡️ **多类型验证码** - CapSolver 自动解决 Cloudflare Turnstile / reCAPTCHA v2 / reCAPTCHA v3 / hCaptcha，失败自动重试
+- 🚀 **纯 API 注册** - 直接调用 ZenMux 接口完成注册，不开浏览器，单号流量 ~60KB，速度极快
+- 🛡️ **验证码** - CapSolver 自动解决 Cloudflare Turnstile + reCAPTCHA v2，失败自动重试
+- 🔄 **重试机制** - 所有 API 调用对网络错误 + 500/502/503 自动重试 3 次；验证码无效自动重取重试
 - 📧 **接码服务** - 内置 hotmail_helper（随面板一键启动），Microsoft Graph 底层取码，支持收件箱 + 垃圾邮件，旧码过滤，未收到自动重发
 - 🔗 **邀请码轮换** - 支持多个邀请码随机选择，注册成功后自动提取新账号邀请码加入轮换
-- 🔑 **API Key 自动创建** - 注册成功后自动创建 Pay API（sk-ai-v1）和 Platform API（sk-mg-v1），带 CSRF 处理
+- 🔑 **API Key 自动创建** - 注册成功后自动创建 Pay API（sk-ai-v1）和 Platform API（sk-mg-v1），带 CSRF 处理（直调 API，不开浏览器）
 - 🚚 **gpt-load 联动** - Pay Key 可一键/自动导入 gpt-load 指定分组
 - ⚡ **并发注册** - 信号量控制并发（默认 3，上限 20），文件写入加锁防损坏；面板可实时调整
-- ⏹ **即时停止** - 按停止立即关闭所有在跑浏览器释放 CPU（不是只挡新号派发）；各阶段响应停止
-- 🌐 **动态代理** - 支持 rotating 代理（每账号独立出口 IP），降低同 IP 风控；面板填写即时保存
-- 💾 **流量优化** - 拦截图片/字体/追踪脚本；邀请码提取与建 key 改直调 API（不开浏览器），单号流量降约一半
-- 🌐 **Web 管理面板** - 零依赖原生 HTTP，深色主题全功能 UI，日志每轮自动清空、显示最新
-- 📦 **批量操作** - 批量导入账号（支持 `----` 分隔文本 / JSON / 文件上传）、批量注册、账号可移出/恢复待注册
+- ⏹ **即时停止** - 各阶段响应停止，按停止立即中止在跑的号
+- 🌐 **动态代理（可选）** - 配置 `PROXY_URL` 则 API 调用走 rotating 代理（每账号独立出口 IP），降低同 IP 风控；不配则直连
+- 🌐 **Web 管理面板** - 零依赖原生 HTTP，深色主题全功能 UI，日志带邮箱标注、每轮自动清空
+- 📦 **批量操作** - 批量导入账号（支持 `----` 分隔文本 / JSON / 文件上传），导入返回重复/无效明细
 - 🖥️ **跨平台** - 支持 Windows / Linux / macOS
 
 ## 环境要求
 
 - **Node.js** >= 18.0.0（推荐 v20+）
 - **Python 3**（hotmail_helper 接码服务，需 `flask`、`requests`）
-- **Playwright Chromium** 浏览器
 - **Microsoft OAuth 账号**（email / client_id / refresh_token）
 - **CapSolver API Key**（自动过验证码）
+- 无需浏览器/Playwright
 
 ## 快速开始
 
@@ -41,13 +41,11 @@ cd register-for-zenmux
 # Node 依赖
 npm install
 
-# Playwright 浏览器（Linux 需额外装系统依赖）
-npx playwright install chromium
-npx playwright install-deps chromium   # 仅 Linux
-
 # Python 依赖（接码服务）
 pip install flask requests
 ```
+
+> 纯 API 模式，无需安装 Playwright / 浏览器。
 
 ### 3. 配置环境变量
 
@@ -118,7 +116,6 @@ RestartSec=5
 StandardOutput=append:/home/ubuntu/register/panel.log
 StandardError=append:/home/ubuntu/register/panel.log
 Environment=NODE_ENV=production
-Environment=PLAYWRIGHT_BROWSERS_PATH=%h/.cache/ms-playwright
 
 [Install]
 WantedBy=default.target
@@ -147,49 +144,44 @@ tail -f /home/ubuntu/register/panel.log   # 或看日志文件
 
 ## 注册流程
 
-每个账号全自动：
+每个账号全自动（纯 API 直调，不开浏览器）：
 
 ```
-1. 已注册（有 session）直接跳过，不重复打码
-2. 随机选邀请码，打开 https://zenmux.ai/invite/{code}（domcontentloaded，不等 networkidle）
-3. 等 "Continue with Email" 按钮渲染（最多 15s），JS click 触发（Playwright 坐标点击有时不触发 React），再等邮箱框出现
-4. 填邮箱
-5. 探测首屏 Turnstile（确认需要才打码，省钱；失败自动重试 3 次）
-6. 点 Send 发送验证码
-7. hotmail_helper 取验证码（仅认本次发送后的新邮件，旧码过滤）
-8. 输入验证码（OTP 多框 / 单框 / 普通框自适应；单框输完补按 Enter，输不满 6 位自动重输）
-9. 等 5s 缓冲后持续轮询：探测二次验证（实测为 reCAPTCHA）或判定登录成功
-10. 登录成功的【唯一硬证据】= /api/referral/info 返回 200
-    （ZenMux 是弹窗登录，输验证码时 URL 不变、cookie 可能是无效 session，
-     不能用 URL/cookie 判断，否则会误判"已登录"跳过二次验证 → 注册失败）
-11. 未登录成功时：出现 reCAPTCHA widget 就打码，否则继续轮询 referral/info（最多 ~90s）
-12. referral/info 返回 200 → 保存 session，【立即关闭浏览器】
-13. 后续邀请码提取 + 建 API key 改用直调 API（读 session 文件里的 cookie 发请求，不开浏览器，省流量）
-14. 自动提取该账号邀请码（加入轮换池）
-15. 自动创建 Pay API key（sk-ai-v1）+ Platform API key（sk-mg-v1）
-16. Pay key 自动导入 gpt-load（若配置 GPTLOAD_PAY_GROUP_ID）
+1. 已注册（有 session）直接跳过
+2. GET /api/frontend/public/appData 取 ctoken
+3. GET /api/get_invite_user?inviteCode=xxx 绑定邀请码
+4. CapSolver 解 Turnstile → POST /api/login/email/code/send {email, token}（发验证码）
+5. hotmail_helper 取验证码（仅认本次发送后到达的新邮件，旧码时间过滤）
+6. POST /api/login/email/code/verify {email, code}（校验验证码）
+7. GET /api/referral/info 检查是否已登录；未登录则 CapSolver 解 reCAPTCHA →
+   POST /api/login/recaptcha/verification {token}（二次验证）
+8. referral/info 返回 200 → 保存 session（cookie）
+9. 直调 API：自动提取邀请码 + 创建 Pay/Platform API key
+10. Pay key 自动导入 gpt-load（若配置 GPTLOAD_PAY_GROUP_ID）
 ```
+
+所有 API 调用对网络错误 + 500/502/503 自动重试 3 次；验证码校验报"Invalid or expired"时等 8s 重取新码重试一次。
 
 **验证码收不到时**：第 1 轮等 65 秒，未收到重发；第 2 轮等 15 秒，仍未收到则跳过该账号。
 
-### 流量优化
+### 流量
 
-- **图片/字体/追踪脚本拦截**：每个浏览器上下文拦截 `image/media/font` 资源 + googletagmanager/gtag 等追踪域名。ZenMux 首页的 banner 图、产品图、gtag 都用不上，单次页面加载从 ~8MB 降到 ~2.5MB。
-- **收尾改直调 API**：注册成功后立刻关浏览器，邀请码提取 + 建 key 用 `zenmuxApiRequest`（读 session cookie 直发请求）代替开浏览器 `page.goto`，省掉每次 ~2MB 的页面加载。
-- **实测**：单号纯代理流量 ~15-30MB（视并发/网络而定），比未优化前降约一半。邮件轮询（Graph API）和直调 API 不走代理。
+纯 API 模式单号流量极低（就几个 API 请求 + CapSolver 打码走服务端不经代理）：
+- 不配代理：单号 ~60KB
+- 配代理：单号代理流量 ~60KB（邮件轮询走 Graph API 不经代理）
 
 ## 并发注册
 
-批量注册时支持并发，多个账号同时进行（等邮件的空闲时间被利用）：
+批量注册时支持并发，多个账号同时进行：
 
-- `CONCURRENCY=3`（默认，上限 20），每个账号开一个独立浏览器
+- `CONCURRENCY=3`（默认，上限 20）
 - 文件写入（账号/邀请码/key）加互斥锁，防并发损坏 JSON
 - 面板「触发注册」可实时调整并发数（注册中不可改）
-- 注意内存：2 核 4G 机器建议 2–3，资源充足可调高
+- 纯 API 模式很轻（不开浏览器），可适当调高并发；但过高会触发 ZenMux 服务端 500/限流，建议 5-10 起步观察
 
-## 动态代理
+## 动态代理（可选）
 
-支持 rotating 代理，每个浏览器走独立出口 IP，降低同 IP 多账号风控：
+配置 `PROXY_URL` 后，注册的 API 调用走 rotating 代理，每账号独立出口 IP，降低同 IP 风控；不配则直连：
 
 ```env
 PROXY_URL=http://user:pass@host:port
@@ -304,8 +296,6 @@ sudo apt-get install -y nodejs
 
 # 依赖
 npm install
-npx playwright install chromium
-npx playwright install-deps chromium
 pip install flask requests
 
 # 常驻后台（推荐 systemd，见上方「常驻后台」小节；PM2 亦可）
@@ -346,22 +336,20 @@ server {
 不会。有 session 的账号自动跳过。
 
 **Q: 并发注册会损坏数据吗？**
-不会。账号/邀请码/API Key 的文件写入都有互斥锁，并发安全。但并发会放大二次验证的时序问题（多个号同时懒渲染 reCAPTCHA、同时打码），建议先单号跑通再调高并发。
+不会。账号/邀请码/API Key 的文件写入都有互斥锁，并发安全。并发过高会触发 ZenMux 服务端 500（`Unknown column 'user_id'` 之类），代码会自动重试 3 次，仍失败则该号跳过、可后面补。
 
 **Q: 代理连不上怎么办？**
-代理连接失败会自动跳过该账号，不影响其它账号注册。检查 `PROXY_URL` 格式与代理可用性。
+配了 `PROXY_URL` 时，代理连接失败会自动重试 3 次（`fetch failed`），仍失败则该号跳过。不配 `PROXY_URL` 则直连，不走代理。
 
-**Q: Linux 无头模式报错？**
-`npx playwright install-deps chromium`
+**Q: 导入账号比文件行数少？**
+导入会跳过重复邮箱（已在列表里）和格式无效行（缺 email/client_id/refresh_token）。导入后弹窗会显示"成功 X 个，重复忽略 Y 个，格式无效 Z 个"+ 重复邮箱列表。
 
 ## 项目结构
 
 ```
 register-for-zenmux/
-├── web_panel.mjs              # Web 管理面板 + 注册核心（零依赖 HTTP）
-├── zenmux_register.mjs        # 命令行注册工具
-├── capsolver_helper.mjs       # CapSolver API 封装（Turnstile/reCAPTCHA/hCaptcha）
-├── capture_apis.mjs           # API 抓包工具（带自动打码）
+├── web_panel.mjs              # Web 管理面板 + 注册核心（纯 API 直调，零依赖 HTTP）
+├── capsolver_helper.mjs       # CapSolver API 封装（Turnstile / reCAPTCHA v2）
 ├── hotmail_helper(1).py       # 邮箱接码服务（Graph 底层）
 ├── public/
 │   └── index.html             # 管理面板 UI
