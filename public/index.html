@@ -801,22 +801,27 @@ async function stopRegister() {
 
 function startTaskPolling() {
   if (polling) clearInterval(polling);
+  let wasRegistering = false;
   polling = setInterval(async () => {
     const data = await api('/api/register/status');
     if (!data.ok) return;
-    if (!data.registering) {
-      clearInterval(polling);
-      polling = null;
+    const logEl = document.getElementById('regTaskLogs');
+    const logs = data.taskLogs || [];
+    // 空闲时后端返回 taskLogs=[]，自动清空；新一轮开始后返回新任务的日志，自动显示最新
+    logEl.innerHTML = logs.map(l => `<div class="log-line">${esc(l)}</div>`).join('');
+    logEl.scrollTop = logEl.scrollHeight;
+    if (data.registering) {
+      wasRegistering = true;
+      document.getElementById('btnRegister').disabled = true;
+      document.getElementById('btnStop').style.display = 'inline-block';
+      document.getElementById('regStatus').innerHTML = '<span style="color:var(--yellow)">⏳ 注册进行中...</span>';
+    } else {
       document.getElementById('btnRegister').disabled = false;
       document.getElementById('btnStop').style.display = 'none';
       document.getElementById('regStatus').innerHTML = '<span style="color:var(--green)">✅ 空闲</span>';
-      loadAccounts();
-      loadResults();
+      // 刚从注册中变空闲：刷新账号/结果（只在状态切换时刷，不每轮刷）
+      if (wasRegistering) { loadAccounts(); loadResults(); wasRegistering = false; }
     }
-    const logEl = document.getElementById('regTaskLogs');
-    const logs = data.taskLogs || [];
-    logEl.innerHTML = logs.map(l => `<div class="log-line">${esc(l)}</div>`).join('');
-    logEl.scrollTop = logEl.scrollHeight;
   }, 1500);
 }
 
@@ -872,6 +877,8 @@ checkConnection();
 startLogPolling();
 loadApiKeys();
 setInterval(checkConnection, 10000);
+// 页面打开时若已有注册任务在跑，自动开始轮询日志（显示最新）
+(async () => { try { const d = await api('/api/register/status'); if (d.ok && d.registering) startTaskPolling(); } catch {} })();
 setInterval(loadAccounts, 3000);  // 3秒刷新一次，实时显示注册状态
 setInterval(loadApiKeys, 15000);  // 15秒刷新 API key 列表
 loadGptLoadGroups();  // 进入 API Keys 标签时加载 gpt-load 分组

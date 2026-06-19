@@ -199,89 +199,47 @@ function saveInviteCode(email, inviteCode) {
   });
 }
 
-// 通过浏览器提取已登录账号的邀请码
-async function extractInviteCode(page, email, taskId) {
+// 直调 ZenMux API（用 session 文件里的 cookie，无需浏览器，省流量）
+// 注册成功后保存了 session 文件，这里直接读 cookie 发请求，不用再开浏览器加载页面。
+// 返回 { ok: bool, status: number, data: any }
+async function zenmuxApiRequest(email, method, reqPath, body) {
+  const statePath = path.join(SESSIONS_DIR, `${email.replace(/[@.]/g, "_")}.json`);
+  if (!fs.existsSync(statePath)) return { ok: false, status: 0, error: "无 session 文件" };
+  let cookies = [];
+  try { cookies = JSON.parse(fs.readFileSync(statePath, "utf-8")).cookies || []; }
+  catch (e) { return { ok: false, status: 0, error: "session 文件损坏" }; }
+  const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+  const ctoken = cookies.find(c => c.name === "ctoken");
+  const headers = { "Accept": "application/json", "Cookie": cookieHeader };
+  if (ctoken) headers["X-CSRF-Token"] = ctoken.value;
+  if (body) headers["Content-Type"] = "application/json";
+  try {
+    const resp = await fetch(`https://zenmux.ai${reqPath}`, {
+      method, headers, body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await resp.text();
+    let data = null; try { data = JSON.parse(text); } catch (e) { data = text; }
+    return { ok: resp.ok, status: resp.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, error: e.message };
+  }
+}
+
+// 直调 API 提取已登录账号的邀请码（无需浏览器）
+async function extractInviteCode(email, taskId) {
   taskLog(taskId, `提取邀请码: ${email}`);
   try {
-    // 方法1: 通过 API 获取
-    const cookies = await page.context().cookies("https://zenmux.ai");
-    const sessionId = cookies.find(c => c.name === "sessionId");
-    if (sessionId) {
-      try {
-        const resp = await page.evaluate(async () => {
-          const r = await fetch("/api/referral/info", {
-            headers: { "Accept": "application/json" },
-            credentials: "include",
-          });
-          if (r.ok) return await r.json();
-          return null;
-        });
-        // 实际返回结构: {success, data:{inviteCode}}；兼容直接挂在根上的情况
-        const code = resp?.data?.inviteCode || resp?.inviteCode;
-        if (code) {
-          taskLog(taskId, `✓ API 获取邀请码: ${code}`);
-          saveInviteCode(email, code);
-          return code;
-        }
-      } catch (e) {
-        taskLog(taskId, `API 获取邀请码失败: ${e.message}`);
+    const r = await zenmuxApiRequest(email, "GET", "/api/referral/info");
+    if (r.ok && r.data) {
+      // 返回结构: {success, data:{inviteCode}}；兼容直接挂在根上
+      const code = r.data?.data?.inviteCode || r.data?.inviteCode;
+      if (code) {
+        taskLog(taskId, `✓ API 获取邀请码: ${code}`);
+        saveInviteCode(email, code);
+        return code;
       }
     }
-
-    // 方法2: 导航到 referral 页面提取（只接受明确的"邀请码"语境，避免误抓页面里其它 6 位大写串如 "TOKENS"）
-    await page.goto("https://zenmux.ai/settings/referral", { waitUntil: "networkidle", timeout: 30_000 });
-    await sleep(2000);
-
-    const code = await page.evaluate(() => {
-      // 只从明确标注为邀请码的输入框/可复制元素取
-      const inputs = Array.from(document.querySelectorAll('input, [data-copy], code'));
-      for (const el of inputs) {
-        const v = (el.value || el.textContent || "").trim();
-        if (/^[A-Z0-9]{6}$/.test(v)) return v;
-      }
-      // 从复制链接里提取（最可靠：邀请链接含 /invite/CODE）
-      const links = Array.from(document.querySelectorAll('a[href*="invite/"], input[value*="invite/"]'));
-      for (const link of links) {
-        const href = link.href || link.value || "";
-        const m = href.match(/invite\/([A-Z0-9]{6})(?:[/?#]|$)/);
-        if (m) return m[1];
-      }
-      return null;
-    });
-
-    if (code) {
-      taskLog(taskId, `✓ 页面提取邀请码: ${code}`);
-      saveInviteCode(email, code);
-      return code;
-    }
-
-    // 方法3: 通过 invite 页面提取
-    await page.goto("https://zenmux.ai/invite", { waitUntil: "networkidle", timeout: 30_000 });
-    await sleep(2000);
-
-    const code2 = await page.evaluate(() => {
-      // 只认明确语境的邀请码，避免抓到 "TOKENS"/"SETTINGS" 等页面文字
-      const inputs = Array.from(document.querySelectorAll('input, code, [data-copy]'));
-      for (const el of inputs) {
-        const v = (el.value || el.textContent || "").trim();
-        if (/^[A-Z0-9]{6}$/.test(v)) return v;
-      }
-      const links = Array.from(document.querySelectorAll('a[href*="invite/"], input[value*="invite/"]'));
-      for (const link of links) {
-        const href = link.href || link.value || "";
-        const m = href.match(/invite\/([A-Z0-9]{6})(?:[/?#]|$)/);
-        if (m) return m[1];
-      }
-      return null;
-    });
-
-    if (code2) {
-      taskLog(taskId, `✓ 页面提取邀请码: ${code2}`);
-      saveInviteCode(email, code2);
-      return code2;
-    }
-
-    taskLog(taskId, `⚠ 未能提取到 ${email} 的邀请码`);
+    taskLog(taskId, `⚠ 未能提取到 ${email} 的邀请码 (referral/info ${r.status})`);
     return null;
   } catch (e) {
     taskLog(taskId, `提取邀请码出错: ${e.message}`);
@@ -318,7 +276,7 @@ function loadApiKeys() {
 
 // 通过浏览器 session 查询/创建 API key
 // type: "pay" (按量付费 sk-ai-v1) 或 "platform" (平台管理 sk-mg-v1)
-async function ensureApiKey(page, email, taskId, type = "pay") {
+async function ensureApiKey(email, taskId, type = "pay") {
   const isPlatform = type === "platform";
   const typeName = isPlatform ? "Platform API (平台管理 sk-mg-v1)" : "Pay API (按量付费 sk-ai-v1)";
   const listPath = isPlatform ? "/api/management_key/list" : "/api/api_key/list?type=Managed";
@@ -328,16 +286,8 @@ async function ensureApiKey(page, email, taskId, type = "pay") {
   taskLog(taskId, `检查/创建 ${typeName}: ${email}`);
 
   try {
-    // 1. 先查询现有 key 列表
-    const listResp = await page.evaluate(async (path) => {
-      const r = await fetch(path, {
-        headers: { "Accept": "application/json" },
-        credentials: "include",
-      });
-      // 返回状态码供上层判断 session 是否已失效
-      if (r.ok) return { ok: true, data: await r.json() };
-      return { ok: false, status: r.status };
-    }, listPath);
+    // 1. 直调 API 查询现有 key 列表
+    const listResp = await zenmuxApiRequest(email, "GET", listPath);
 
     // session 失效（401/403）→ 通知调用方需要重新登录
     if (!listResp.ok && (listResp.status === 401 || listResp.status === 403)) {
@@ -360,25 +310,11 @@ async function ensureApiKey(page, email, taskId, type = "pay") {
       return existing;
     }
 
-    // 3. 创建新 key
+    // 3. 直调 API 创建新 key（CSRF 头由 zenmuxApiRequest 从 ctoken cookie 自动带）
     const keyName = `${autoPrefix}${email.split("@")[0]}`;
     taskLog(taskId, `创建新 ${typeName} key: ${keyName}`);
-
-    // 两类 create 接口都需要 CSRF 头（从 ctoken cookie 取）；platform 类连 list 也需要
-    const createResp = await page.evaluate(async ({ path, name, withTags }) => {
-      const body = withTags ? { name, tags: [] } : { name };
-      const headers = { "Content-Type": "application/json", "Accept": "application/json" };
-      const m = document.cookie.match(/(?:^|;\s*)ctoken=([^;]+)/);
-      if (m) headers["X-CSRF-Token"] = m[1];
-      const r = await fetch(path, {
-        method: "POST",
-        headers,
-        credentials: "include",
-        body: JSON.stringify(body),
-      });
-      if (r.ok) return { ok: true, data: await r.json() };
-      return { ok: false, status: r.status, error: `HTTP ${r.status}`, body: await r.text().catch(() => "") };
-    }, { path: createPath, name: keyName, withTags: !isPlatform });
+    const createBody = isPlatform ? { name: keyName } : { name: keyName, tags: [] };
+    const createResp = await zenmuxApiRequest(email, "POST", createPath, createBody);
 
     // 创建接口也 401/403 → session 失效，需重新登录
     if (!createResp.ok && (createResp.status === 401 || createResp.status === 403)) {
@@ -518,6 +454,19 @@ let stopRequested = false;       // 是否请求停止
 let currentTaskId = null;
 const registeringAccounts = new Set(); // 正在注册中的账号邮箱
 const taskLogs = new Map(); // taskId -> string[]
+const activeBrowsers = new Set(); // 当前在跑的 browser 实例，停止时用来主动全关释放 CPU
+
+// 停止：主动关闭所有在跑的浏览器，立刻释放 CPU/内存
+// （否则正在跑的号会继续打码/等邮件/轮询到自然结束，CPU 一直占着）
+function closeAllActiveBrowsers() {
+  if (activeBrowsers.size === 0) return;
+  const toClose = [...activeBrowsers];
+  activeBrowsers.clear();
+  console.log(`  [停止] 立即关闭 ${toClose.length} 个在跑浏览器，释放资源`);
+  // 不 await：让关闭在后台进行，正在 await 页面操作的账号会立刻收到
+  // "Target page/context/browser has been closed" 异常而退出
+  Promise.all(toClose.map((b) => b.close().catch(() => {}))).catch(() => {});
+}
 
 // ---- 文件写入互斥锁（并发时防止 JSON 读-改-写竞争损坏文件）----
 const fileLocks = new Map(); // filePath -> Promise chain
@@ -676,6 +625,8 @@ async function fetchVerificationCode(email, refresh_token, client_id, taskId, co
   const helperDeadline = startTime + timeout;
 
   while (Date.now() < helperDeadline) {
+    // 已请求停止 → 立即退出轮询，不继续等邮件
+    if (stopRequested) { taskLog(taskId, `⏹ 已停止，停止等验证码: ${email}`); return null; }
     // 检查收件箱 + 垃圾邮件
     for (const mailbox of ["INBOX", "Junk"]) {
       try {
@@ -852,6 +803,21 @@ async function solveSecondaryCaptcha(page, taskId, probe, sitekey) {
   return false;
 }
 
+// 流量节省：拦截图片/字体/追踪脚本（注册用不到 banner 图、产品图、gtag 追踪）
+// 单次页面加载从 ~8MB 降到 ~2.5MB，砍约 70%。Turnstile/reCAPTCHA 是脚本不受影响。
+const BLOCK_RES_TYPES = new Set(["image", "media", "font"]);
+const BLOCK_URL_RE = /googletagmanager|google-analytics|gtag\/js|doubleclick|googlesyndication|facebook\.com\/tr|connect\.facebook|hotjar|sentry\.io|umeng|hm\.baidu|clarity\.ms|plausible|segment\.io|amplitude/;
+function applyTrafficSaver(context) {
+  context.route("**/*", (route) => {
+    const req = route.request();
+    try {
+      if (BLOCK_RES_TYPES.has(req.resourceType())) return route.abort();
+      if (BLOCK_URL_RE.test(req.url())) return route.abort();
+    } catch (e) {}
+    return route.continue();
+  });
+}
+
 async function registerAccount(account, taskId) {
   const { email, refresh_token, client_id } = account;
 
@@ -878,11 +844,14 @@ async function registerAccount(account, taskId) {
 
   try {
     taskLog(taskId, `开始注册: ${email}`);
+    // 派发后到启动浏览器之间可能已请求停止，直接退出不浪费资源
+    if (stopRequested) { result.error = "已停止"; return result; }
     const proxy = parseProxy(CONFIG.PROXY_URL);
     if (proxy) taskLog(taskId, `使用代理: ${proxy.server}${proxy.username ? " (带鉴权)" : ""}`);
     const launchOpts = { headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO };
     if (proxy) launchOpts.proxy = proxy;
     browser = await chromium.launch(launchOpts);
+    activeBrowsers.add(browser);  // 登记，停止时能主动关掉释放 CPU
     // 启动后简单验证代理是否生效：若 newContext 失败多半是代理连不上
     try {
       context = await browser.newContext({
@@ -890,6 +859,7 @@ async function registerAccount(account, taskId) {
         viewport: { width: 1280, height: 800 },
         locale: "en-US",
       });
+      applyTrafficSaver(context);
     } catch (e) {
       if (proxy) {
         taskLog(taskId, `⚠ 代理连接失败: ${e.message}，跳过该账号`);
@@ -933,12 +903,13 @@ async function registerAccount(account, taskId) {
 
     if (inviteCode) {
       taskLog(taskId, `使用邀请码: ${inviteCode} (共 ${allCodes.length} 个可用)`);
-      await page.goto(`https://zenmux.ai/invite/${inviteCode}`, { waitUntil: "networkidle", timeout: 60_000 });
+      await page.goto(`https://zenmux.ai/invite/${inviteCode}`, { waitUntil: "domcontentloaded", timeout: 60_000 });
     } else {
       taskLog(taskId, "打开 ZenMux（无可用邀请码）...");
-      await page.goto("https://zenmux.ai", { waitUntil: "networkidle", timeout: 60_000 });
+      await page.goto("https://zenmux.ai", { waitUntil: "domcontentloaded", timeout: 60_000 });
     }
-    await sleep(3000);
+    // 不用 networkidle（ZenMux 有长连接/轮询，networkidle 可能永不触发导致 60s 超时）
+    // 后面有 waitForSelector("Continue with Email", 15s) 兜底等按钮渲染
 
     // ---- 2. Sign In ----
     taskLog(taskId, "查找 Sign In...");
@@ -951,12 +922,26 @@ async function registerAccount(account, taskId) {
     await sleep(2000);
 
     // Continue with Email
+    // 邀请页加载较慢（约5-6s才渲染出按钮）。等按钮出现（15s 上限），稍等 React 挂上 onClick，再用 JS click 触发
+    // （Playwright 坐标点击有时不触发 React onClick，JS .click() 更可靠）
     taskLog(taskId, "点击 Continue with Email...");
-    try {
-      const emailBtn = page.locator('button:has-text("Continue with Email")').first();
-      if (await emailBtn.isVisible({ timeout: 5000 })) await emailBtn.click();
-    } catch (e) {}
-    await sleep(2500);
+    await page.waitForSelector("text=Continue with Email", { timeout: 15_000 }).catch(() => {});
+    await sleep(500);  // 等 React 把 onClick 挂到按钮上
+    let clickedText = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll("button, a, [role='button']"));
+      const t = (e) => (e.textContent || "").trim().toLowerCase();
+      const target = els.find(e => t(e).includes("continue with email"));
+      if (target) { target.click(); return target.textContent.trim(); }
+      return null;
+    });
+    if (clickedText) taskLog(taskId, `✓ 已点击 (JS): "${clickedText}"`);
+    else {
+      taskLog(taskId, `⚠ 没找到 Continue with Email 元素，列页面按钮...`);
+      const allBtns = await page.evaluate(() => Array.from(document.querySelectorAll("button,a")).map(b => (b.textContent||"").trim()).filter(Boolean).slice(0, 15));
+      taskLog(taskId, `  页面按钮: ${JSON.stringify(allBtns)}`);
+    }
+    // 点完等邮箱框出现（最多 10s）
+    await page.waitForSelector('input[type="email"], input#email, input[placeholder*="email" i]', { timeout: 10_000 }).catch(() => {});
 
     // ---- 3. 填邮箱 ----
     let emailInput = null;
@@ -969,7 +954,16 @@ async function registerAccount(account, taskId) {
         if (emailInput) break;
       } catch (e) {}
     }
-    if (!emailInput) { result.error = "找不到邮箱输入框"; return result; }
+    if (!emailInput) {
+      // 找不到邮箱框：截图 + 抓页面可见文本，便于排查（代理被风控/页面改版/弹窗不同）
+      try {
+        await page.screenshot({ path: `/tmp/zenmux_no_email_${email.replace(/[^a-z0-9]/gi, "_")}_${Date.now()}.png` });
+        const txt = await page.evaluate(() => (document.body?.innerText || "").slice(0, 500));
+        taskLog(taskId, `❌ 找不到邮箱输入框，URL=${page.url()} 页面文本: ${JSON.stringify(txt.slice(0, 300))}`);
+      } catch (e) { taskLog(taskId, `❌ 找不到邮箱输入框 (截图失败: ${e.message})`); }
+      result.error = "找不到邮箱输入框";
+      return result;
+    }
     await emailInput.click({ clickCount: 3 });
     await emailInput.fill(email);
     taskLog(taskId, `已输入邮箱: ${email}`);
@@ -1346,6 +1340,7 @@ async function registerAccount(account, taskId) {
     let secondary = null;
     let loginDetectedEarly = false;
     for (let i = 0; i < 45; i++) {  // 45 × 2s = 最多再 90s（前面已等 5s 缓冲）
+      if (stopRequested) break;  // 已停止 → 不再轮询
       secondary = await detectSecondaryCaptcha();
       if (secondary.need || secondary.hasToken) break;
       // 登录成功的唯一硬证据：/api/referral/info 返回 200（非 401）。
@@ -1401,6 +1396,7 @@ async function registerAccount(account, taskId) {
     let sessionId = null;
     const loginDeadline = Date.now() + 60_000;
     while (Date.now() < loginDeadline) {
+      if (stopRequested) break;  // 已停止 → 不再等登录
       await sleep(2000);
       try {
         const probe = await page.evaluate(async () => {
@@ -1434,22 +1430,41 @@ async function registerAccount(account, taskId) {
       }) + "\n");
 
       // 自动提取该账号的邀请码（用于后续轮换）
-      await extractInviteCode(page, email, taskId);
+      // 停止则跳过后续收尾（邀请码提取/建 key/导入），账号已注册成功，下次再补
+      if (stopRequested) {
+        taskLog(taskId, `⏹ 已停止，跳过邀请码提取与 API key 创建: ${email}`);
+      } else {
+        // session 已保存到文件，后续邀请码提取/建 key 改用直调 API（不用浏览器，省流量）
+        // 先关掉浏览器，避免它继续跑后台请求/占用资源
+        try { await context.close(); } catch (e) {}
+        activeBrowsers.delete(browser);
+        if (browser) { try { await browser.close(); } catch (e) {} }
+        browser = null;
 
-      // 自动创建 API key：Pay API（按量付费 sk-ai-v1）+ Platform API（平台管理 sk-mg-v1）
-      await ensureApiKey(page, email, taskId, "pay");
-      await ensureApiKey(page, email, taskId, "platform");
+        await extractInviteCode(email, taskId);
+
+        // 自动创建 API key：Pay API（按量付费 sk-ai-v1）+ Platform API（平台管理 sk-mg-v1）
+        await ensureApiKey(email, taskId, "pay");
+        await ensureApiKey(email, taskId, "platform");
+      }
     } else {
       result.error = "登录未完成（referral/info 未返回 200）";
       taskLog(taskId, `❌ 注册失败: ${email} (${result.error})`);
     }
   } catch (e) {
-    result.error = e.message;
-    taskLog(taskId, `❌ 注册出错: ${e.message}`);
+    // 停止导致的 browser 被关会抛 "Target page/context/browser has been closed"，别当成报错
+    if (stopRequested) {
+      result.error = "已停止";
+      taskLog(taskId, `⏹ 已停止: ${email}`);
+    } else {
+      result.error = e.message;
+      taskLog(taskId, `❌ 注册出错: ${e.message}`);
+    }
   } finally {
     // 移除注册中状态
     registeringAccounts.delete(email.toLowerCase());
-    if (browser) await browser.close();
+    activeBrowsers.delete(browser);
+    if (browser) { try { await browser.close(); } catch (e) {} }
     taskLog(taskId, `结束注册: ${email} | 耗时 ${Math.round((Date.now() - startedAt) / 1000)}s | ${result.success ? "成功" : "失败"}`);
   }
   return result;
@@ -1779,7 +1794,9 @@ async function handleRequest(req, res) {
     // 停止注册
     if (pathname === "/api/register/stop" && req.method === "POST") {
       stopRequested = true;
-      registering = false;
+      // 关键：主动关闭所有在跑浏览器，立刻释放 CPU
+      // （stopRequested 只能挡新号派发，对已在跑的号无效——必须靠关 browser 中断）
+      closeAllActiveBrowsers();
       return json(res, { ok: true });
     }
 
@@ -1812,19 +1829,9 @@ async function handleRequest(req, res) {
       taskLogs.set(taskId, []);
 
       (async () => {
-        let browser = null;
         try {
-          const proxy = parseProxy(CONFIG.PROXY_URL);
-          const launchOpts = { headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO };
-          if (proxy) launchOpts.proxy = proxy;
-          browser = await chromium.launch(launchOpts);
-          const statePath = path.join(SESSIONS_DIR, `${account.email.replace(/[@.]/g, "_")}.json`);
-          const context = await browser.newContext({ storageState: statePath });
-          const page = await context.newPage();
-          await page.goto("https://zenmux.ai", { waitUntil: "networkidle", timeout: 60_000 });
-          await sleep(2000);
-          const code = await extractInviteCode(page, account.email, taskId);
-          await context.close();
+          // 直调 API 提取邀请码，不用开浏览器（省流量）
+          const code = await extractInviteCode(account.email, taskId);
           if (code) {
             taskLog(taskId, `✅ 提取完成: ${account.email} → ${code}`);
           } else {
@@ -1835,7 +1842,6 @@ async function handleRequest(req, res) {
         } finally {
           registering = false;
           currentTaskId = null;
-          if (browser) await browser.close();
         }
       })();
 
@@ -1884,7 +1890,7 @@ async function handleRequest(req, res) {
       if (!account) return json(res, { ok: false, error: "未找到账号" }, 404);
 
       const sessions = loadSessions();
-      const hasSession = sessions.find((s) => s.email.toLowerCase() === account.email.toLowerCase());
+      let hasSession = sessions.find((s) => s.email.toLowerCase() === account.email.toLowerCase());
 
       registering = true;
       const taskId = `apikey_${Date.now()}`;
@@ -1914,20 +1920,8 @@ async function handleRequest(req, res) {
                 : `❌ ${keyType} API key 未找到`);
               return savedKey || null;
             }
-            // 有 session：复用登录态直接查/建
-            const proxy = parseProxy(CONFIG.PROXY_URL);
-            const launchOpts = { headless: CONFIG.HEADLESS, slowMo: CONFIG.SLOW_MO };
-            if (proxy) launchOpts.proxy = proxy;
-            browser = await chromium.launch(launchOpts);
-            const statePath = path.join(SESSIONS_DIR, `${account.email.replace(/[@.]/g, "_")}.json`);
-            const context = await browser.newContext({ storageState: statePath });
-            const page = await context.newPage();
-            await page.goto("https://zenmux.ai", { waitUntil: "networkidle", timeout: 60_000 });
-            await sleep(2000);
-            let key = await ensureApiKey(page, account.email, taskId, keyType);
-            await context.close();
-            await browser.close();
-            browser = null;
+            // 有 session：直调 API 查/建（不用开浏览器，省流量）
+            let key = await ensureApiKey(account.email, taskId, keyType);
 
             // 死 session：删掉旧 session 文件，重新走登录流程
             if (key && key.__needRelogin) {

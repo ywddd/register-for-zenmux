@@ -11,8 +11,10 @@
 - 🔑 **API Key 自动创建** - 注册成功后自动创建 Pay API（sk-ai-v1）和 Platform API（sk-mg-v1），带 CSRF 处理
 - 🚚 **gpt-load 联动** - Pay Key 可一键/自动导入 gpt-load 指定分组
 - ⚡ **并发注册** - 信号量控制并发（默认 3，上限 20），文件写入加锁防损坏；面板可实时调整
+- ⏹ **即时停止** - 按停止立即关闭所有在跑浏览器释放 CPU（不是只挡新号派发）；各阶段响应停止
 - 🌐 **动态代理** - 支持 rotating 代理（每账号独立出口 IP），降低同 IP 风控；面板填写即时保存
-- 🌐 **Web 管理面板** - 零依赖原生 HTTP，深色主题全功能 UI
+- 💾 **流量优化** - 拦截图片/字体/追踪脚本；邀请码提取与建 key 改直调 API（不开浏览器），单号流量降约一半
+- 🌐 **Web 管理面板** - 零依赖原生 HTTP，深色主题全功能 UI，日志每轮自动清空、显示最新
 - 📦 **批量操作** - 批量导入账号（支持 `----` 分隔文本 / JSON / 文件上传）、批量注册、账号可移出/恢复待注册
 - 🖥️ **跨平台** - 支持 Windows / Linux / macOS
 
@@ -149,24 +151,32 @@ tail -f /home/ubuntu/register/panel.log   # 或看日志文件
 
 ```
 1. 已注册（有 session）直接跳过，不重复打码
-2. 随机选邀请码，打开 https://zenmux.ai/invite/{code}
-3. 填邮箱
-4. 探测首屏 Turnstile（确认需要才打码，省钱；失败自动重试 3 次）
-5. 点 Send 发送验证码
-6. hotmail_helper 取验证码（仅认本次发送后的新邮件，旧码过滤）
-7. 输入验证码（OTP 多框 / 单框 / 普通框自适应；单框输完补按 Enter，输不满 6 位自动重输）
-8. 等 5s 缓冲后持续轮询：探测二次验证（实测为 reCAPTCHA）或判定登录成功
-9. 登录成功的【唯一硬证据】= /api/referral/info 返回 200
-   （ZenMux 是弹窗登录，输验证码时 URL 不变、cookie 可能是无效 session，
-    不能用 URL/cookie 判断，否则会误判"已登录"跳过二次验证 → 注册失败）
-10. 未登录成功时：出现 reCAPTCHA widget 就打码，否则继续轮询 referral/info（最多 ~90s）
-11. referral/info 返回 200 → 保存 session
-12. 自动提取该账号邀请码（加入轮换池）
-13. 自动创建 Pay API key（sk-ai-v1）+ Platform API key（sk-mg-v1）
-14. Pay key 自动导入 gpt-load（若配置 GPTLOAD_PAY_GROUP_ID）
+2. 随机选邀请码，打开 https://zenmux.ai/invite/{code}（domcontentloaded，不等 networkidle）
+3. 等 "Continue with Email" 按钮渲染（最多 15s），JS click 触发（Playwright 坐标点击有时不触发 React），再等邮箱框出现
+4. 填邮箱
+5. 探测首屏 Turnstile（确认需要才打码，省钱；失败自动重试 3 次）
+6. 点 Send 发送验证码
+7. hotmail_helper 取验证码（仅认本次发送后的新邮件，旧码过滤）
+8. 输入验证码（OTP 多框 / 单框 / 普通框自适应；单框输完补按 Enter，输不满 6 位自动重输）
+9. 等 5s 缓冲后持续轮询：探测二次验证（实测为 reCAPTCHA）或判定登录成功
+10. 登录成功的【唯一硬证据】= /api/referral/info 返回 200
+    （ZenMux 是弹窗登录，输验证码时 URL 不变、cookie 可能是无效 session，
+     不能用 URL/cookie 判断，否则会误判"已登录"跳过二次验证 → 注册失败）
+11. 未登录成功时：出现 reCAPTCHA widget 就打码，否则继续轮询 referral/info（最多 ~90s）
+12. referral/info 返回 200 → 保存 session，【立即关闭浏览器】
+13. 后续邀请码提取 + 建 API key 改用直调 API（读 session 文件里的 cookie 发请求，不开浏览器，省流量）
+14. 自动提取该账号邀请码（加入轮换池）
+15. 自动创建 Pay API key（sk-ai-v1）+ Platform API key（sk-mg-v1）
+16. Pay key 自动导入 gpt-load（若配置 GPTLOAD_PAY_GROUP_ID）
 ```
 
 **验证码收不到时**：第 1 轮等 65 秒，未收到重发；第 2 轮等 15 秒，仍未收到则跳过该账号。
+
+### 流量优化
+
+- **图片/字体/追踪脚本拦截**：每个浏览器上下文拦截 `image/media/font` 资源 + googletagmanager/gtag 等追踪域名。ZenMux 首页的 banner 图、产品图、gtag 都用不上，单次页面加载从 ~8MB 降到 ~2.5MB。
+- **收尾改直调 API**：注册成功后立刻关浏览器，邀请码提取 + 建 key 用 `zenmuxApiRequest`（读 session cookie 直发请求）代替开浏览器 `page.goto`，省掉每次 ~2MB 的页面加载。
+- **实测**：单号纯代理流量 ~15-30MB（视并发/网络而定），比未优化前降约一半。邮件轮询（Graph API）和直调 API 不走代理。
 
 ## 并发注册
 
