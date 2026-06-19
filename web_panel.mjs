@@ -1058,6 +1058,16 @@ async function handleRequest(req, res) {
     if (pathname === "/api/accounts" && req.method === "GET") {
       const accounts = loadAccounts();
       const sessions = loadSessions();
+      // 读邀请码文件，建 email→inviteCode 映射（每个账号自己的邀请码）
+      const icMap = {};
+      if (fs.existsSync(INVITE_CODES_FILE)) {
+        try {
+          const icData = JSON.parse(fs.readFileSync(INVITE_CODES_FILE, "utf-8"));
+          for (const ic of icData) {
+            if (ic && ic.email && ic.inviteCode) icMap[ic.email.toLowerCase()] = ic.inviteCode;
+          }
+        } catch (e) {}
+      }
       const enriched = accounts.map((a) => {
         const session = sessions.find((s) => s.email.toLowerCase() === a.email.toLowerCase());
         const isRegistering = registeringAccounts.has(a.email.toLowerCase());
@@ -1066,6 +1076,7 @@ async function handleRequest(req, res) {
           registered: !!session,
           registering: isRegistering,
           sessionId: session?.sessionId || null,
+          inviteCode: icMap[a.email.toLowerCase()] || null,
           refresh_token: "***"
         };
       });
@@ -1378,6 +1389,84 @@ async function handleRequest(req, res) {
     // 获取已保存的 API key 列表
     if (pathname === "/api/api-keys" && req.method === "GET") {
       return json(res, { ok: true, keys: loadApiKeys() });
+    }
+
+    // 检查所有已注册账号的 pay/platform key 状态
+    if (pathname === "/api/api-keys/status" && req.method === "GET") {
+      const sessions = loadSessions();
+      const keys = loadApiKeys();
+      const keyMap = {};
+      for (const k of keys) {
+        const e = (k.email || "").toLowerCase();
+        if (!e) continue;
+        keyMap[e] = keyMap[e] || {};
+        if (k.keyType === "platform") { keyMap[e].platform = true; keyMap[e].platformToken = k.token; }
+        else { keyMap[e].pay = true; keyMap[e].payToken = k.token; }
+      }
+      const status = sessions.map((s) => {
+        const km = keyMap[(s.email || "").toLowerCase()] || {};
+        return { email: s.email, hasPay: !!km.pay, hasPlatform: !!km.platform, payToken: km.payToken || null, platformToken: km.platformToken || null };
+      });
+      const missingPay = status.filter((s) => !s.hasPay).length;
+      const missingPlatform = status.filter((s) => !s.hasPlatform).length;
+      return json(res, { ok: true, status, total: status.length, missingPay, missingPlatform });
+    }
+
+    // 批量补建缺失的 key（后台任务，逐个直调 API）
+    if (pathname === "/api/api-keys/ensure-all" && req.method === "POST") {
+      if (registering) return json(res, { ok: false, error: "已有任务在运行" }, 409);
+      const body = await parseBody(req);
+      const only = body.only; // "pay" | "platform" | undefined(两者都补)
+      const sessions = loadSessions();
+      const keys = loadApiKeys();
+      const keyMap = {};
+      for (const k of keys) {
+        const e = (k.email || "").toLowerCase();
+        keyMap[e] = keyMap[e] || {};
+        if (k.keyType === "platform") keyMap[e].platform = true;
+        else keyMap[e].pay = true;
+      }
+      // 待补建列表：[{email, needPay, needPlatform}]
+      const todo = [];
+      for (const s of sessions) {
+        const km = keyMap[(s.email || "").toLowerCase()] || {};
+        const needPay = !km.pay && only !== "platform";
+        const needPlatform = !km.platform && only !== "pay";
+        if (needPay || needPlatform) todo.push({ email: s.email, needPay, needPlatform });
+      }
+      if (todo.length === 0) return json(res, { ok: true, added: 0, message: "所有账号 key 齐全，无需补建" });
+
+      registering = true;
+      const taskId = `ensureall_${Date.now()}`;
+      currentTaskId = taskId;
+      taskLogs.set(taskId, []);
+
+      (async () => {
+        let done = 0;
+        try {
+          taskLog(taskId, `批量补建 key：共 ${todo.length} 个账号待处理`);
+          for (const t of todo) {
+            if (stopRequested) { taskLog(taskId, `⏹ 已停止，已处理 ${done}/${todo.length}`); break; }
+            taskLog(taskId, `[${t.email}] 检查/补建 key...`);
+            try {
+              if (t.needPay) await ensureApiKey(t.email, taskId, "pay");
+              if (t.needPlatform && !stopRequested) await ensureApiKey(t.email, taskId, "platform");
+            } catch (e) {
+              taskLog(taskId, `[${t.email}] 出错: ${e.message}`);
+            }
+            done++;
+          }
+          taskLog(taskId, `批量补建完成：处理 ${done}/${todo.length}`);
+        } catch (e) {
+          taskLog(taskId, `批量补建出错: ${e.message}`);
+        } finally {
+          registering = false;
+          stopRequested = false;
+          currentTaskId = null;
+        }
+      })();
+
+      return json(res, { ok: true, taskId, count: todo.length });
     }
 
     // 手动为已注册账号创建/检查 API key (pay 或 platform)

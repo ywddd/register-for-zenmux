@@ -121,13 +121,26 @@
   <div class="tab-content active" id="tab-accounts">
     <div class="card">
       <div class="card-title"><span class="icon">👤</span> 账号列表</div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
+        <span style="font-size:13px;color:var(--text2)">每页</span>
+        <select id="acctPageSize" onchange="acctCurPage=0;renderAccounts()" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:12px">
+          <option>20</option><option>50</option><option selected>100</option><option>200</option>
+        </select>
+        <input id="acctSearch" placeholder="搜索邮箱..." oninput="acctCurPage=0;renderAccounts()" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:12px;width:200px">
+        <span id="acctSummary" style="font-size:13px;color:var(--text2);margin-left:auto"></span>
+      </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>邮箱</th><th>类型</th><th>状态</th><th>Session</th><th>操作</th></tr></thead>
+          <thead><tr><th>邮箱</th><th>类型</th><th>状态</th><th>我的邀请码</th><th>Session</th><th>操作</th></tr></thead>
           <tbody id="accountsBody"></tbody>
         </table>
       </div>
       <div id="accountsEmpty" class="empty" style="display:none">暂无账号，请添加或批量导入</div>
+      <div id="acctPager" style="display:flex;gap:8px;align-items:center;justify-content:center;margin-top:12px;font-size:13px;color:var(--text2)">
+        <button class="btn btn-sm" style="background:var(--border)" onclick="acctPage(-1)">‹ 上一页</button>
+        <span id="acctPageInfo"></span>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="acctPage(1)">下一页 ›</button>
+      </div>
     </div>
     <div class="grid2">
       <div class="card">
@@ -226,36 +239,32 @@
     <div class="card">
       <div class="card-title"><span class="icon">🔑</span> API Keys 管理</div>
       <p style="font-size:13px;color:var(--text2);margin-bottom:14px">
-        每个账号注册成功后会自动创建两个 key：<b>Pay API</b>（按量付费 sk-ai-v1）和 <b>Platform API</b>（平台管理 sk-mg-v1）。也可对已注册账号手动创建。
+        每个已注册账号的 <b>Pay key</b>（sk-ai-v1）和 <b>Platform key</b>（sk-mg-v1）左右一一对应。缺 key 的号标红，可一键补建（走 session 直调 API，不开浏览器）。
       </p>
-      <div class="field">
-        <label>选择已注册账号</label>
-        <select id="keyEmail" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;width:100%">
-          <option value="">-- 选择账号 --</option>
-        </select>
-      </div>
-      <div style="display:flex;gap:8px;margin-top:8px">
-        <button class="btn btn-primary btn-sm" onclick="ensureKey('pay')">创建/检查 Pay API</button>
-        <button class="btn btn-primary btn-sm" onclick="ensureKey('platform')">创建/检查 Platform API</button>
-        <button class="btn btn-sm" style="background:var(--border)" onclick="loadApiKeys()">刷新列表</button>
-      </div>
-      <div id="keyEmpty" class="empty" style="display:none">暂无 API key</div>
-    </div>
-
-    <div class="card">
-      <div class="card-title"><span class="icon">📋</span> 已保存的 API Keys</div>
-      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('pay')">⬇ 导出 Pay Key (txt)</button>
-        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('platform')">⬇ 导出 Platform Key (txt)</button>
-        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('all')">⬇ 导出全部 (txt)</button>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-primary btn-sm" onclick="checkKeyStatus()">🔄 刷新</button>
+        <button class="btn btn-primary btn-sm" onclick="ensureAllKeys()">⚡ 一键补建缺失</button>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('pay')">⬇ 导出 Pay</button>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('platform')">⬇ 导出 Platform</button>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="exportKeys('all')">⬇ 导出全部</button>
+        <span id="keyStatusSummary" style="font-size:13px;color:var(--text2);margin-left:auto"></span>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>邮箱</th><th>类型</th><th>名称</th><th>Token</th><th>状态</th><th>操作</th></tr></thead>
-          <tbody id="apiKeysBody"></tbody>
+          <thead><tr><th style="width:28%">邮箱</th><th>Pay Key (sk-ai-v1)</th><th>Platform Key (sk-mg-v1)</th></tr></thead>
+          <tbody id="keyStatusBody"></tbody>
         </table>
       </div>
-      <div id="apiKeysEmpty" class="empty" style="display:none">暂无 API key，注册账号后会自动创建</div>
+      <div id="keyStatusEmpty" class="empty" style="display:none">暂无数据</div>
+      <div id="keyStatusPager" style="display:flex;gap:8px;align-items:center;justify-content:center;margin-top:12px;font-size:13px;color:var(--text2);flex-wrap:wrap">
+        <span>每页</span>
+        <select id="keyStatusPageSize" onchange="keyStatusCurPage=0;renderKeyStatus()" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:12px">
+          <option>20</option><option>50</option><option>100</option><option>200</option>
+        </select>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="keyStatusPage(-1)">‹ 上一页</button>
+        <span id="keyStatusPageInfo"></span>
+        <button class="btn btn-sm" style="background:var(--border)" onclick="keyStatusPage(1)">下一页 ›</button>
+      </div>
     </div>
 
     <div class="card">
@@ -362,64 +371,89 @@ async function refreshAll() {
   await Promise.all([loadAccounts(), loadResults(), loadConfig(), refreshStatus()]);
 }
 
+let allAccounts = [];
+let acctCurPage = 0;
+
 async function loadAccounts() {
   const data = await api('/api/accounts');
   if (!data.ok) return;
-  const accounts = data.accounts || [];
+  allAccounts = data.accounts || [];
   const body = document.getElementById('accountsBody');
   const empty = document.getElementById('accountsEmpty');
   const regSel = document.getElementById('regEmail');
 
-  document.getElementById('statAccounts').textContent = accounts.length;
-  document.getElementById('statRegistered').textContent = accounts.filter(a => a.registered).length;
-  document.getElementById('statRegistering').textContent = accounts.filter(a => a.registering).length;
-
-  if (accounts.length === 0) {
-    body.innerHTML = '';
-    empty.style.display = 'block';
-  } else {
-    empty.style.display = 'none';
-    body.innerHTML = accounts.map(a => {
-      let statusBadge = '';
-      if (a.skip) {
-        statusBadge = '<span class="badge" style="background:rgba(100,116,139,.15);color:#64748b">⏭ 已跳过</span>';
-      } else if (a.registering) {
-        statusBadge = '<span class="badge badge-registering">⏳ 注册中</span>';
-      } else if (a.registered) {
-        statusBadge = '<span class="badge badge-ok">✓ 已注册</span>';
-      } else {
-        statusBadge = '<span class="badge badge-pending">未注册</span>';
-      }
-      // 跳过的账号：从待注册列表移除；点恢复加回
-      const skipBtn = a.skip
-        ? `<button class="btn btn-sm btn-primary" onclick="toggleSkip('${esc(a.email)}', false)">恢复</button>`
-        : `<button class="btn btn-sm" style="background:var(--border)" onclick="toggleSkip('${esc(a.email)}', true)">移出待注册</button>`;
-      const rowStyle = a.skip ? 'opacity:.5' : '';
-      return `
-      <tr style="${rowStyle}">
-        <td>${esc(a.email)}</td>
-        <td>${esc(a.type || 'microsoft')}</td>
-        <td>${statusBadge}</td>
-        <td style="font-family:monospace;font-size:11px">${a.sessionId ? esc(a.sessionId.slice(0, 16)) + '...' : '-'}</td>
-        <td>
-          ${skipBtn}
-          ${a.registered ? `<button class="btn btn-sm btn-danger" onclick="deleteSession('${esc(a.email)}')" style="margin-left:4px">清除Session</button>` : ''}
-          ${a.registering ? '' : `<button class="btn btn-sm btn-danger" onclick="confirmDeleteAccount('${esc(a.email)}')" style="margin-left:4px">删除</button>`}
-        </td>
-      </tr>
-    `}).join('');
-  }
+  document.getElementById('statAccounts').textContent = allAccounts.length;
+  document.getElementById('statRegistered').textContent = allAccounts.filter(a => a.registered).length;
+  document.getElementById('statRegistering').textContent = allAccounts.filter(a => a.registering).length;
 
   // Update register dropdown
   const currentVal = regSel.value;
   regSel.innerHTML = '<option value="">-- 全部未注册 --</option>';
-  accounts.forEach(a => {
+  allAccounts.forEach(a => {
     let label = esc(a.email);
     if (a.registering) label += ' (注册中)';
     else if (a.registered) label += ' (已注册)';
     regSel.innerHTML += `<option value="${esc(a.email)}"${a.registering ? ' disabled' : ''}>${label}</option>`;
   });
   regSel.value = currentVal;
+
+  renderAccounts();
+}
+
+function acctPageSize() { return parseInt(document.getElementById('acctPageSize').value) || 100; }
+function acctPage(delta) {
+  const filtered = filteredAccounts();
+  const ps = acctPageSize();
+  const maxPage = Math.max(0, Math.ceil(filtered.length / ps) - 1);
+  acctCurPage = Math.max(0, Math.min(maxPage, acctCurPage + delta));
+  renderAccounts();
+}
+function filteredAccounts() {
+  const q = (document.getElementById('acctSearch').value || '').trim().toLowerCase();
+  if (!q) return allAccounts;
+  return allAccounts.filter(a => (a.email || '').toLowerCase().includes(q));
+}
+
+function renderAccounts() {
+  const body = document.getElementById('accountsBody');
+  const empty = document.getElementById('accountsEmpty');
+  const pager = document.getElementById('acctPager');
+  const info = document.getElementById('acctPageInfo');
+  const summary = document.getElementById('acctSummary');
+  const filtered = filteredAccounts();
+  if (filtered.length === 0) {
+    body.innerHTML = ''; empty.style.display = 'block'; pager.style.display = 'none'; summary.textContent = '';
+    return;
+  }
+  empty.style.display = 'none';
+  const ps = acctPageSize();
+  const maxPage = Math.max(0, Math.ceil(filtered.length / ps) - 1);
+  if (acctCurPage > maxPage) acctCurPage = maxPage;
+  const start = acctCurPage * ps;
+  const page = filtered.slice(start, start + ps);
+  body.innerHTML = page.map(a => {
+    let statusBadge = '';
+    if (a.skip) statusBadge = '<span class="badge" style="background:rgba(100,116,139,.15);color:#64748b">⏭ 已跳过</span>';
+    else if (a.registering) statusBadge = '<span class="badge badge-registering">⏳ 注册中</span>';
+    else if (a.registered) statusBadge = '<span class="badge badge-ok">✓ 已注册</span>';
+    else statusBadge = '<span class="badge badge-pending">未注册</span>';
+    const skipBtn = a.skip
+      ? `<button class="btn btn-sm btn-primary" onclick="toggleSkip('${esc(a.email)}', false)">恢复</button>`
+      : `<button class="btn btn-sm" style="background:var(--border)" onclick="toggleSkip('${esc(a.email)}', true)">移出待注册</button>`;
+    const rowStyle = a.skip ? 'opacity:.5' : '';
+    return `<tr style="${rowStyle}">
+        <td>${esc(a.email)}</td><td>${esc(a.type || 'microsoft')}</td><td>${statusBadge}</td>
+        <td style="font-family:monospace;font-size:11px;color:${a.inviteCode ? 'var(--accent)' : 'var(--text2)'}">${a.inviteCode ? esc(a.inviteCode) : '-'}</td>
+        <td style="font-family:monospace;font-size:11px">${a.sessionId ? esc(a.sessionId.slice(0, 16)) + '...' : '-'}</td>
+        <td>${skipBtn}
+          ${a.registered ? `<button class="btn btn-sm btn-danger" onclick="deleteSession('${esc(a.email)}')" style="margin-left:4px">清除Session</button>` : ''}
+          ${a.registering ? '' : `<button class="btn btn-sm btn-danger" onclick="confirmDeleteAccount('${esc(a.email)}')" style="margin-left:4px">删除</button>`}
+        </td></tr>`;
+  }).join('');
+  pager.style.display = 'flex';
+  const total = allAccounts.length;
+  summary.textContent = `共 ${total} 个账号${filtered.length !== total ? `（筛选 ${filtered.length}）` : ''}`;
+  info.textContent = `第 ${acctCurPage + 1} / ${maxPage + 1} 页（${start + 1}-${Math.min(start + ps, filtered.length)} / ${filtered.length}）`;
 }
 
 // 切换账号跳过注册
@@ -526,27 +560,9 @@ async function extractCode() {
 
 // ---- API Keys ----
 async function loadApiKeys() {
-  try {
-    const data = await api('/api/api-keys');
-    const keys = data.ok ? (data.keys || []) : [];
-    const body = document.getElementById('apiKeysBody');
-    const empty = document.getElementById('apiKeysEmpty');
-    if (keys.length === 0) { body.innerHTML = ''; empty.style.display = 'block'; }
-    else {
-      empty.style.display = 'none';
-      body.innerHTML = keys.map(k => `
-        <tr>
-          <td>${esc(k.email)}</td>
-          <td>${k.keyType === 'platform' ? '<span class="badge" style="background:rgba(168,85,247,.15);color:#a855f7">Platform</span>' : '<span class="badge" style="background:rgba(59,130,246,.15);color:var(--blue)">Pay</span>'}</td>
-          <td>${esc(k.name || '-')}</td>
-          <td style="font-family:monospace;font-size:11px">${k.token ? esc(k.token.slice(0, 24)) + '...' : '-'}</td>
-          <td>${k.enabled !== false ? '<span class="badge badge-ok">启用</span>' : '<span class="badge badge-pending">禁用</span>'}</td>
-          <td>${k.token ? `<button class="btn btn-sm" style="background:var(--border)" onclick="copyToken('${esc(k.token)}')">复制</button>` : ''}</td>
-        </tr>`).join('');
-    }
-    // 更新下拉框
-    await loadKeyDropdown();
-  } catch {}
+  // 已合并到「账号 Key 状态」表格（checkKeyStatus），这里仅刷新 key 状态 + 下拉框
+  checkKeyStatus();
+  await loadKeyDropdown();
 }
 
 async function loadKeyDropdown() {
@@ -592,6 +608,83 @@ async function ensureKey(type) {
 // 导出 key 为 txt
 function exportKeys(type) {
   window.location.href = `/api/api-keys/export?type=${type}`;
+}
+
+// ---- 账号 Key 状态检查（分页，pay/platform 左右对应）----
+let keyStatusData = [];
+let keyStatusCurPage = 0;
+
+function keyStatusPageSize() {
+  return parseInt(document.getElementById('keyStatusPageSize').value) || 20;
+}
+
+async function checkKeyStatus() {
+  const summary = document.getElementById('keyStatusSummary');
+  summary.textContent = '加载中...';
+  try {
+    const data = await api('/api/api-keys/status');
+    if (!data.ok) { summary.textContent = data.error || '失败'; return; }
+    keyStatusData = data.status || [];
+    keyStatusCurPage = 0;
+    const missP = data.missingPay || 0, missM = data.missingPlatform || 0;
+    summary.innerHTML = `共 <b>${data.total}</b> 个已注册 · 缺 Pay <b style="color:var(--red)">${missP}</b> · 缺 Platform <b style="color:var(--red)">${missM}</b>`;
+    renderKeyStatus();
+  } catch (e) { summary.textContent = '加载失败: ' + e.message; }
+}
+
+function keyStatusPage(delta) {
+  const ps = keyStatusPageSize();
+  const maxPage = Math.max(0, Math.ceil(keyStatusData.length / ps) - 1);
+  keyStatusCurPage = Math.max(0, Math.min(maxPage, keyStatusCurPage + delta));
+  renderKeyStatus();
+}
+
+function renderKeyStatus() {
+  const body = document.getElementById('keyStatusBody');
+  const empty = document.getElementById('keyStatusEmpty');
+  const pager = document.getElementById('keyStatusPager');
+  const info = document.getElementById('keyStatusPageInfo');
+  if (!keyStatusData.length) {
+    body.innerHTML = ''; empty.style.display = 'block'; pager.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  const ps = keyStatusPageSize();
+  const maxPage = Math.max(0, Math.ceil(keyStatusData.length / ps) - 1);
+  if (keyStatusCurPage > maxPage) keyStatusCurPage = maxPage;
+  const start = keyStatusCurPage * ps;
+  const page = keyStatusData.slice(start, start + ps);
+  body.innerHTML = page.map(s => {
+    const pay = s.hasPay
+      ? `<span style="font-family:monospace;font-size:11px;color:var(--green)">${esc(s.payToken.slice(0, 18))}... <a href="#" onclick="copyToken('${esc(s.payToken)}');return false" style="color:var(--blue)">复制</a></span>`
+      : `<span style="color:var(--red)">✗ 缺失</span>`;
+    const plat = s.hasPlatform
+      ? `<span style="font-family:monospace;font-size:11px;color:var(--green)">${esc(s.platformToken.slice(0, 18))}... <a href="#" onclick="copyToken('${esc(s.platformToken)}');return false" style="color:var(--blue)">复制</a></span>`
+      : `<span style="color:var(--red)">✗ 缺失</span>`;
+    const rowStyle = (!s.hasPay || !s.hasPlatform) ? 'background:rgba(239,68,68,.06)' : '';
+    return `<tr style="${rowStyle}"><td>${esc(s.email)}</td><td>${pay}</td><td>${plat}</td></tr>`;
+  }).join('');
+  pager.style.display = 'flex';
+  info.textContent = `第 ${keyStatusCurPage + 1} / ${maxPage + 1} 页（${start + 1}-${Math.min(start + ps, keyStatusData.length)} / ${keyStatusData.length}）`;
+}
+
+async function ensureAllKeys() {
+  if (!keyStatusData.length) { await checkKeyStatus(); }
+  const miss = keyStatusData.filter(s => !s.hasPay || !s.hasPlatform).length;
+  if (!miss) return alert('所有账号 key 齐全，无需补建');
+  if (!confirm(`将补建 ${miss} 个账号的缺失 key（走 session 直调 API），查看日志？`)) return;
+  const data = await api('/api/api-keys/ensure-all', { method: 'POST', body: JSON.stringify({}) });
+  if (data.ok) {
+    alert(`开始补建 ${data.count} 个账号，请查看日志`);
+    document.querySelector('.tab[data-tab="register"]').click();
+    startTaskPolling();
+    const checkDone = setInterval(async () => {
+      const st = await api('/api/register/status');
+      if (st.ok && !st.registering) { clearInterval(checkDone); checkKeyStatus(); }
+    }, 3000);
+  } else {
+    alert(data.error || '操作失败');
+  }
 }
 
 // gpt-load 分组列表
@@ -879,13 +972,15 @@ function esc(str) {
 refreshAll();
 checkConnection();
 startLogPolling();
-loadApiKeys();
 setInterval(checkConnection, 10000);
 // 页面打开时若已有注册任务在跑，自动开始轮询日志（显示最新）
 (async () => { try { const d = await api('/api/register/status'); if (d.ok && d.registering) startTaskPolling(); } catch {} })();
 setInterval(loadAccounts, 3000);  // 3秒刷新一次，实时显示注册状态
-setInterval(loadApiKeys, 15000);  // 15秒刷新 API key 列表
 loadGptLoadGroups();  // 进入 API Keys 标签时加载 gpt-load 分组
+// 切到 API Keys 标签时自动加载 key 状态
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => { if (t.dataset.tab === 'keys') checkKeyStatus(); });
+});
 </script>
 </body>
 </html>
